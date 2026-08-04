@@ -1,5 +1,5 @@
 {
-  "name": "earth-voice-console-web",
+  "name": "@voice/web",
   "private": true,
   "version": "0.0.0",
   "type": "module",
