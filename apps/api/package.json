@@ -4,6 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "tsx src/index.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "echo \"@voice/api: no lint configured\""
@@ -15,6 +17,7 @@
   },
   "devDependencies": {
     "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
     "typescript": "^5.6.3",
     "vitest": "^2.1.4"
   }
