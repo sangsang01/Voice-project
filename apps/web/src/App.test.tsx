@@ -9,7 +9,7 @@ describe('App', () => {
     expect(screen.getByRole('heading', { name: 'Earth Assistant' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Start' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled()
-    expect(screen.getByText('Standby')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Standby')
     expect(screen.getByText('Press Start and speak — your words appear here.')).toBeInTheDocument()
   })
 
@@ -20,6 +20,17 @@ describe('App', () => {
 
     expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
-    expect(screen.getByText('Listening')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Listening')
+  })
+
+  it('resets a listening session to its standby baseline', () => {
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Restart' }))
+
+    expect(screen.getByRole('button', { name: 'Start' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled()
+    expect(screen.getByRole('status')).toHaveTextContent('Standby')
   })
 })

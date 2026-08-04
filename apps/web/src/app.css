@@ -129,6 +129,10 @@ button { font: inherit; }
 @keyframes globe-turn { to { transform: rotate(360deg) scale(1.06); } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
 
+@media (prefers-reduced-motion: reduce) {
+  .earth-globe__surface, .earth-globe__clouds, .status-dot--listening { animation: none; }
+}
+
 @media (max-width: 720px) {
   .app-shell { align-items: flex-start; padding: 20px; }
   .voice-console { grid-template-columns: 1fr; }

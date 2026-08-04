@@ -31,10 +31,10 @@ export function App() {
 
           <button className="control-button" disabled={listening} onClick={() => setListening(true)} type="button">Start</button>
           <button className="control-button" disabled={!listening} onClick={() => setListening(false)} type="button">Stop</button>
-          <button className="control-button" type="button">Restart</button>
+          <button className="control-button" onClick={() => setListening(false)} type="button">Restart</button>
 
           <div className="console-meta">
-            <p className="status"><span className={`status-dot${listening ? ' status-dot--listening' : ''}`} aria-hidden="true" />{listening ? 'Listening' : 'Standby'}</p>
+            <p aria-atomic="true" aria-live="polite" className="status" role="status"><span className={`status-dot${listening ? ' status-dot--listening' : ''}`} aria-hidden="true" />{listening ? 'Listening' : 'Standby'}</p>
             <p className="clock">Local {formatClock(now, false)} · UTC {formatClock(now, true)}</p>
           </div>
         </aside>
