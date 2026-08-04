@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./server": "./src/server.ts"
+    "./server": "./src/server.ts",
+    "./browser": "./src/browser.ts"
   },
   "scripts": {
     "test": "vitest run",
