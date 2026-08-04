@@ -135,7 +135,7 @@ The performance target is first provisional text within three seconds on the doc
 
 ## Google fallback behavior
 
-The cloud engine sends the same 16 kHz mono PCM frames over an authenticated application WebSocket to `apps/api`. The API keeps Google Application Default Credentials on the server and opens a V1 `StreamingRecognize` call. The first selected language is the primary language and the remaining one to three values are `alternativeLanguageCodes`.
+The cloud engine sends the same 16 kHz mono PCM frames over an origin-checked application WebSocket to `apps/api`. The API keeps Google Application Default Credentials on the server and opens a V1 `StreamingRecognize` call. The first selected language is the primary language and the remaining one to three values are `alternativeLanguageCodes`. This MVP gateway is for local development or a trusted deployment; a public deployment must add its own user authentication before enabling the paid fallback.
 
 The server enforces a ten-minute maximum session, a thirty-second speech/audio idle timeout, an input-frame size limit, ordered frame sequences, and bounded buffering. Browser disconnect, Stop, timeout, Google error, or process shutdown closes the Google stream exactly once. Provider responses are normalized to the shared event contract; Google-specific errors never leak credentials or raw internal details.
 
