@@ -156,6 +156,7 @@ describe("TranscriptionAdapter", () => {
     fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Microphone permission was denied");
+    expect(screen.getByRole("status")).toHaveTextContent("Standby");
 
     fireEvent.click(screen.getByRole("button", { name: "Use cloud transcription" }));
     expect(screen.getByRole("dialog")).toHaveTextContent("Cloud transcription sends audio off this device");

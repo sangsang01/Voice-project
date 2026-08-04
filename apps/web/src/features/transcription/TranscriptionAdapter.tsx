@@ -35,9 +35,9 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
     return () => { window.clearInterval(clock); void controllerRef.current?.dispose(); };
   }, []);
 
-  const listening = starting || state.engineState === "listening" || state.engineState === "draining";
-  const hasValidSelection = candidateLanguages.length >= 1 && candidateLanguages.length <= 4 && new Set(candidateLanguages).size === candidateLanguages.length;
   const error = selectionError ?? localError ?? state.fatalError?.message;
+  const listening = !error && (starting || state.engineState === "listening" || state.engineState === "draining");
+  const hasValidSelection = candidateLanguages.length >= 1 && candidateLanguages.length <= 4 && new Set(candidateLanguages).size === candidateLanguages.length;
   const toggleLanguage = (tag: string) => {
     setSelectionError(undefined);
     setCandidateLanguages((selected) => selected.includes(tag) ? selected.filter((language) => language !== tag) : [...selected, tag]);
