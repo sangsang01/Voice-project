@@ -3,13 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": {
+    "./server": "./src/server.ts"
+  },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "echo \"@voice/google-transcription-engine: no lint configured\""
   },
   "dependencies": {
-    "@voice/transcription-contracts": "*"
+    "@voice/transcription-contracts": "*",
+    "@google-cloud/speech": "^6.7.0"
   },
   "devDependencies": {
     "typescript": "^5.6.3",
