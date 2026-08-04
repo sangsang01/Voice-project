@@ -25,6 +25,17 @@ function segmentEvent(
 }
 
 describe("sessionReducer", () => {
+  it("accepts the first contract event at sequence zero", () => {
+    const initial = createSessionState("session-new");
+
+    expect(sessionReducer(initial, {
+      type: "state",
+      sessionId: "session-new",
+      sequence: 0,
+      state: "listening",
+    }).engineState).toBe("listening");
+  });
+
   it("updates a provisional segment and replaces it with its final revision", () => {
     const initial = createSessionState("session-new");
     const provisional = segmentEvent("session-new", 1, {

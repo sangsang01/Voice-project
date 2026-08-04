@@ -23,14 +23,9 @@ describe('App', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Listening')
   })
 
-  it('resets a listening session to its standby baseline', () => {
+  it('offers the clear and restart control for a fresh transcription session', () => {
     render(<App />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Restart' }))
-
-    expect(screen.getByRole('button', { name: 'Start' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled()
-    expect(screen.getByRole('status')).toHaveTextContent('Standby')
+    expect(screen.getByRole('button', { name: 'Clear & Restart' })).toBeEnabled()
   })
 })

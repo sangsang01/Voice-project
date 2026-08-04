@@ -33,7 +33,7 @@ export type SessionAction = EngineEvent | { type: "clear"; nextSessionId: string
 export function createSessionState(sessionId: string): SessionState {
   return makeState({
     sessionId,
-    lastEventSequence: 0,
+    lastEventSequence: -1,
     engineState: "stopped",
     segmentsById: {},
     orderedSegmentIds: [],
