@@ -156,8 +156,7 @@ async function createTransformersRuntime() {
         async load({ device, onProgress }, signal) {
             if (signal.aborted)
                 throw new DOMException("Aborted", "AbortError");
-            const moduleName = "@huggingface/transformers";
-            const transformers = await import(/* @vite-ignore */ moduleName);
+            const transformers = (await import("@huggingface/transformers"));
             pipeline = await transformers.pipeline(LOCAL_MODEL.task, LOCAL_MODEL.id, {
                 revision: LOCAL_MODEL.revision,
                 device,

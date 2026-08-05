@@ -195,8 +195,7 @@ async function createTransformersRuntime(): Promise<WhisperRuntime> {
   return {
     async load({ device, onProgress }, signal) {
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-      const moduleName = "@huggingface/transformers";
-      const transformers = await import(/* @vite-ignore */ moduleName) as {
+      const transformers = (await import("@huggingface/transformers")) as {
         pipeline: (task: string, model: string, options: Record<string, unknown>) => Promise<typeof pipeline>;
       };
       pipeline = await transformers.pipeline(LOCAL_MODEL.task, LOCAL_MODEL.id, {
