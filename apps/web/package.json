@@ -14,6 +14,9 @@
     "lint": "eslint . --max-warnings=0"
   },
   "dependencies": {
+    "@voice/google-transcription-engine": "*",
+    "@voice/local-whisper-engine": "*",
+    "@voice/transcription-contracts": "*",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },

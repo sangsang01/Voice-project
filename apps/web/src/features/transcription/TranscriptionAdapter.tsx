@@ -1,18 +1,21 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { EarthGlobe } from "../../components/EarthGlobe";
 import { CloudConsentDialog } from "./CloudConsentDialog";
+import { createTranscriptionEngine } from "./engineFactory";
 import { SessionController, type EngineFactory, type MicrophoneFactory } from "./sessionController";
 import { createSessionState, sessionReducer } from "./sessionReducer";
 
 const LANGUAGES = [["en-US", "English (US)"], ["vi-VN", "Vietnamese"], ["es-ES", "Spanish"], ["zh-CN", "Chinese"]] as const;
-interface TranscriptionAdapterProps { initialLanguages?: readonly string[]; engineFactory?: EngineFactory; microphoneFactory?: MicrophoneFactory; onCloudConsent?(): void; }
+const DEFAULT_WEBSOCKET_URL = (import.meta.env.VITE_TRANSCRIPTION_WS_URL as string | undefined) ?? "ws://localhost:8080";
+type EngineKind = "local" | "cloud";
+interface TranscriptionAdapterProps { initialLanguages?: readonly string[]; engineFactory?: EngineFactory; microphoneFactory?: MicrophoneFactory; websocketUrl?: string; onCloudConsent?(): void; }
 
 function formatClock(date: Date, utc: boolean) {
   const part = (value: number) => String(value).padStart(2, "0");
   return `${part(utc ? date.getUTCHours() : date.getHours())}:${part(utc ? date.getUTCMinutes() : date.getMinutes())}:${part(utc ? date.getUTCSeconds() : date.getSeconds())}`;
 }
 
-export function TranscriptionAdapter({ initialLanguages = [], engineFactory, microphoneFactory, onCloudConsent }: TranscriptionAdapterProps) {
+export function TranscriptionAdapter({ initialLanguages = [], engineFactory, microphoneFactory, websocketUrl = DEFAULT_WEBSOCKET_URL, onCloudConsent }: TranscriptionAdapterProps) {
   const [state, dispatch] = useReducer(sessionReducer, "transcription-idle", createSessionState);
   const [candidateLanguages, setCandidateLanguages] = useState<readonly string[]>(initialLanguages);
   const [selectionError, setSelectionError] = useState<string>();
@@ -20,19 +23,39 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
   const [backpressureWarning, setBackpressureWarning] = useState<string>();
   const [starting, setStarting] = useState(false);
   const [cloudDialogOpen, setCloudDialogOpen] = useState(false);
+  const [engineKind, setEngineKind] = useState<EngineKind>("local");
   const [now, setNow] = useState(() => new Date());
-  const controllerRef = useRef<SessionController | null>(null);
-  if (controllerRef.current == null) controllerRef.current = new SessionController({
-    dispatch,
-    engineFactory,
-    microphoneFactory,
-    onLocalError: setLocalError,
-    onBackpressureWarning: setBackpressureWarning,
-  });
+  // Read by the default engine factory below so a fresh engine of the *current*
+  // kind is created on every start(), without needing to recreate the controller.
+  const engineKindRef = useRef<EngineKind>(engineKind);
+  useEffect(() => {
+    engineKindRef.current = engineKind;
+  }, [engineKind]);
+
+  // Constructed in an effect (not during render) so the ref above is safe to
+  // close over -- SessionController itself has no serializable render output.
+  const [controller, setController] = useState<SessionController | null>(null);
+  useEffect(() => {
+    const instance = new SessionController({
+      dispatch,
+      engineFactory: engineFactory ?? (() => createTranscriptionEngine({
+        kind: engineKindRef.current,
+        cloudConsent: engineKindRef.current === "cloud",
+        websocketUrl,
+      })),
+      microphoneFactory,
+      onLocalError: setLocalError,
+      onBackpressureWarning: setBackpressureWarning,
+    });
+    setController(instance);
+    return () => { void instance.dispose(); };
+    // Constructed once per mount; engineFactory/microphoneFactory overrides and websocketUrl are test/config seams, not reactive inputs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const clock = window.setInterval(() => setNow(new Date()), 1000);
-    return () => { window.clearInterval(clock); void controllerRef.current?.dispose(); };
+    return () => window.clearInterval(clock);
   }, []);
 
   const error = selectionError ?? localError ?? state.fatalError?.message;
@@ -54,11 +77,11 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
         <aside className="console-controls">
           <header className="console-title"><p>Voice console</p><h1>Earth Assistant</h1></header>
           <div aria-label="Candidate languages">{LANGUAGES.map(([tag, label]) => <button aria-pressed={candidateLanguages.includes(tag)} className="control-button" key={tag} onClick={() => toggleLanguage(tag)} type="button">{label}</button>)}</div>
-          <button className="control-button" disabled={listening} onClick={() => void run(() => controllerRef.current!.start(candidateLanguages))} type="button">Start</button>
-          <button className="control-button" disabled={!listening} onClick={() => void controllerRef.current!.stop()} type="button">Stop</button>
-          <button className="control-button" onClick={() => void run(() => controllerRef.current!.clearAndRestart(candidateLanguages))} type="button">Clear &amp; Restart</button>
-          <button className="control-button" onClick={() => setCloudDialogOpen(true)} type="button">Use cloud transcription</button>
-          <div className="console-meta"><p aria-atomic="true" aria-live="polite" className="status" role="status"><span className={`status-dot${listening ? " status-dot--listening" : ""}`} aria-hidden="true" />{listening ? "Listening" : "Standby"}</p><p className="clock">Local {formatClock(now, false)} · UTC {formatClock(now, true)}</p></div>
+          <button className="control-button" disabled={!controller || listening} onClick={() => controller && void run(() => controller.start(candidateLanguages))} type="button">Start</button>
+          <button className="control-button" disabled={!controller || !listening} onClick={() => controller && void controller.stop()} type="button">Stop</button>
+          <button className="control-button" disabled={!controller} onClick={() => controller && void run(() => controller.clearAndRestart(candidateLanguages))} type="button">Clear &amp; Restart</button>
+          <button className="control-button" disabled={listening} onClick={() => engineKind === "cloud" ? setEngineKind("local") : setCloudDialogOpen(true)} type="button">{engineKind === "cloud" ? "Switch to local transcription" : "Use cloud transcription"}</button>
+          <div className="console-meta"><p aria-atomic="true" aria-live="polite" className="status" role="status"><span className={`status-dot${listening ? " status-dot--listening" : ""}`} aria-hidden="true" />{listening ? "Listening" : "Standby"}</p><p className="engine-mode">{engineKind === "cloud" ? "Cloud transcription (consented)" : "Local transcription (on this device)"}</p><p className="clock">Local {formatClock(now, false)} · UTC {formatClock(now, true)}</p></div>
         </aside>
         <section className="console-output" aria-label="Voice transcript">
           <EarthGlobe listening={listening} />
@@ -71,7 +94,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
           {error && <p role="alert">{error}</p>}
         </section>
       </section>
-      <CloudConsentDialog onCancel={() => setCloudDialogOpen(false)} onConfirm={() => { setCloudDialogOpen(false); onCloudConsent?.(); }} open={cloudDialogOpen} />
+      <CloudConsentDialog onCancel={() => setCloudDialogOpen(false)} onConfirm={() => { setCloudDialogOpen(false); setEngineKind("cloud"); onCloudConsent?.(); }} open={cloudDialogOpen} />
     </main>
   );
 }
