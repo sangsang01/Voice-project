@@ -27,5 +27,6 @@ set_target_properties(whisper-bridge PROPERTIES
         -sMAXIMUM_MEMORY=2GB \
         -sPTHREAD_POOL_SIZE=4 \
         -sEXPORTED_RUNTIME_METHODS=['FS','HEAPU8','HEAPF32'] \
+        -sEXPORTED_FUNCTIONS=['_malloc','_free'] \
         -sWASM_BIGINT=0 \
         -sSINGLE_FILE=0")

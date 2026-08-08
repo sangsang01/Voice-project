@@ -1,9 +1,9 @@
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 #include "whisper.h"
 
@@ -52,6 +52,9 @@ public:
         return whisper_vad_n_probs(vctx);
     }
 
+    // whisper_vad_probs() returns a pointer into vctx's internal std::vector<float>,
+    // which whisper.cpp resizes on every whisper_vad_detect_speech_no_reset() call.
+    // The pointer is only valid until the next VAD call -- read it immediately after vadProbs().
     std::uintptr_t probsPtr() const {
         return vctx == nullptr ? 0 : reinterpret_cast<std::uintptr_t>(whisper_vad_probs(vctx));
     }
