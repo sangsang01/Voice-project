@@ -19,7 +19,11 @@ export function describeEngineContract(name, createEngine, fixture) {
             const { engine, session } = await openPreparedSession(createEngine, fixture.request);
             const events = [];
             session.subscribe((event) => events.push(event));
-            expect(session.push(fixture.frame)).toEqual({ accepted: true });
+            const frameCount = fixture.framesBeforeStop ?? 1;
+            for (let index = 0; index < frameCount; index += 1) {
+                const frame = { ...fixture.frame, sequence: index, startMs: index * 20 };
+                expect(session.push(frame)).toEqual({ accepted: true });
+            }
             await session.stop();
             const listeningIndex = events.findIndex((event) => event.type === "state" && event.state === "listening");
             const drainingIndex = events.findIndex((event) => event.type === "state" && event.state === "draining");

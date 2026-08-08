@@ -2,6 +2,7 @@ import { describeEngineContract, makePcmFrame, makeSessionRequest } from "@voice
 import { LocalWhisperEngine, type WorkerLike } from "../src/LocalWhisperEngine.js";
 import { createWorkerController, type WhisperRuntime } from "../src/worker/localWhisper.worker.js";
 import type { MainToWorker, WorkerEvent } from "../src/worker/protocol.js";
+import { VAD_DEFAULTS } from "../src/worker/vadGate.js";
 
 class RuntimeWorker implements WorkerLike {
   public onmessage: ((event: MessageEvent<WorkerEvent>) => void) | null = null;
@@ -32,9 +33,17 @@ function runtime(): WhisperRuntime {
   };
 }
 
+// This engine only emits a segment once enough speech-classified audio has
+// crossed VAD_DEFAULTS.minSpeechMs -- one 20ms frame can't even fill a single
+// 512-sample Silero window. Push comfortably more than minSpeechMs worth of
+// frames (double it, for margin around window quantization) so the generic
+// lifecycle test's "push, then stop" still yields exactly one utterance.
+const framesBeforeStop = Math.ceil((VAD_DEFAULTS.minSpeechMs * 2) / 20);
+
 describeEngineContract("local whisper", () => new LocalWhisperEngine({ workerFactory: () => new RuntimeWorker(runtime()) }), {
   request: makeSessionRequest(["en-US"]),
   frame: makePcmFrame(0),
+  framesBeforeStop,
 });
 
 // Worker-controller-specific behavior (VAD-driven utterance boundaries, buffer

@@ -6,6 +6,9 @@ import type { PcmFrame, SessionRequest } from "../types.js";
 export interface EngineContractFixture {
   request: SessionRequest;
   frame: PcmFrame;
+  /** Frames to push before stop(). Engines that segment on voice activity
+   *  need enough audio to form an utterance; one frame is not enough. */
+  framesBeforeStop?: number;
 }
 
 const terminalPushResult: PushResult = { accepted: false, reason: "backpressure" };
@@ -41,7 +44,11 @@ export function describeEngineContract(
       const events: EngineEvent[] = [];
       session.subscribe((event) => events.push(event));
 
-      expect(session.push(fixture.frame)).toEqual({ accepted: true });
+      const frameCount = fixture.framesBeforeStop ?? 1;
+      for (let index = 0; index < frameCount; index += 1) {
+        const frame: PcmFrame = { ...fixture.frame, sequence: index, startMs: index * 20 };
+        expect(session.push(frame)).toEqual({ accepted: true });
+      }
       await session.stop();
 
       const listeningIndex = events.findIndex(
