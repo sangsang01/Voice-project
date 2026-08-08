@@ -19,7 +19,7 @@ export interface LocalCapabilities {
 //   function section:  1 function, using type 0
 //   code section:      1 body (20 bytes): 0 locals,
 //                       v128.const i32x4 0 0 0 0 (0xfd 0x0c + 16 zero bytes), end
-const SIMD_PROBE = Uint8Array.of(
+export const SIMD_PROBE = Uint8Array.of(
   0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
   0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
   0x03, 0x02, 0x01, 0x00,
