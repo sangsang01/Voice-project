@@ -1,6 +1,11 @@
+/**
+ * Weights are fetched once at install time into apps/web/public/models and
+ * served from our own origin. Nothing here points at huggingface.co at runtime.
+ * Bump cacheVersion whenever a filename changes so stale Cache API entries drop.
+ */
 export declare const LOCAL_MODEL: {
-    readonly id: "onnx-community/whisper-small";
-    readonly revision: "main";
-    readonly cacheVersion: 2;
-    readonly task: "automatic-speech-recognition";
+    readonly whisper: "ggml-tiny-q5_1.bin";
+    readonly vad: "ggml-silero-v6.2.0.bin";
+    readonly basePath: "/models";
+    readonly cacheVersion: 3;
 };

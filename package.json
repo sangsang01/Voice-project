@@ -6,6 +6,8 @@
     "build": "npm run build --workspaces --if-present",
     "test": "npm run build && npm run test --workspaces --if-present",
     "typecheck": "npm run build && npm run typecheck --workspaces --if-present",
-    "lint": "npm run lint --workspaces --if-present"
+    "lint": "npm run lint --workspaces --if-present",
+    "fetch-models": "node scripts/fetch-models.mjs",
+    "postinstall": "node scripts/fetch-models.mjs"
   }
 }
