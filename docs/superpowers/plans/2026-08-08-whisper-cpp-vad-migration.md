@@ -710,13 +710,23 @@ export interface LocalCapabilities {
   reason?: string;
 }
 
-// The 10-byte header of a module whose body uses v128 -- the smallest reliable
-// feature probe for WASM SIMD.
+// A minimal WebAssembly module whose sole function has signature () -> v128
+// and whose body is `v128.const i32x4 0 0 0 0` followed by `end`. Validating
+// this module is the standard feature-detection trick for WASM SIMD support:
+// engines without SIMD reject the v128 result type / v128.const opcode.
+//
+//   \0asm, version 1
+//   type section:     1 type, func () -> v128            (0x7b = v128)
+//   function section:  1 function, using type 0
+//   code section:      1 body (20 bytes): 0 locals,
+//                       v128.const i32x4 0 0 0 0 (0xfd 0x0c + 16 zero bytes), end
 const SIMD_PROBE = Uint8Array.of(
   0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
   0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
   0x03, 0x02, 0x01, 0x00,
-  0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x00, 0xfd, 0x0f, 0x1a, 0x0b,
+  0x0a, 0x16, 0x01, 0x14, 0x00,
+  0xfd, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x0b,
 );
 
 function detectSimd(): boolean {
@@ -2636,11 +2646,10 @@ Then commit the regenerated files.
 
 - [ ] **Step 4: Delete the stale planning docs**
 
-`docs/agent-tasks/` is tracked; `report/` is untracked, so `git rm` would fail on it:
+Both paths are tracked, so `git rm` handles both:
 
 ```bash
-git rm -r docs/agent-tasks
-rm -rf report
+git rm -r docs/agent-tasks report
 ```
 
 - [ ] **Step 5: Verify the whole repo**
