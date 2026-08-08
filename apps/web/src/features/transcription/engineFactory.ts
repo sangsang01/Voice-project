@@ -6,6 +6,7 @@ export interface CreateTranscriptionEngineOptions {
   kind: "local" | "cloud";
   cloudConsent: boolean;
   websocketUrl: string;
+  onProgress?: (progress: number) => void;
 }
 
 /**
@@ -14,7 +15,7 @@ export interface CreateTranscriptionEngineOptions {
  * entrypoint, which never references @google-cloud/speech.
  */
 export function createTranscriptionEngine(options: CreateTranscriptionEngineOptions): TranscriptionEngine {
-  if (options.kind === "local") return new LocalWhisperEngine();
+  if (options.kind === "local") return new LocalWhisperEngine({ onProgress: options.onProgress });
   return new CloudEngineClient({
     cloudConsent: options.cloudConsent,
     websocketUrl: options.websocketUrl,

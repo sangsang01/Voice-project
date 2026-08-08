@@ -1,9 +1,21 @@
 import { LOCAL_MODEL } from "../modelManifest.js";
 const FRAME_MS = 20;
+class TranscribeTimeoutError extends Error {
+}
 export function createWorkerController(runtime, post, options = {}) {
     const now = options.now ?? (() => performance.now());
-    const maxBufferedFrames = options.maxBufferedFrames ?? 50;
-    const windowFrames = options.windowFrames ?? 25;
+    // Whisper always runs its encoder over a fixed-length (~30s-padded) window, so a
+    // transcribe() call costs roughly the same fixed amount regardless of how little real
+    // audio it covers. Measured on whisper-small/q8: ~1.8-2.0s fixed cost per call, vs.
+    // ~0.8s for whisper-tiny. A short window asks for that fixed cost too often, which is
+    // slower than realtime on modest hardware and starves the queue. 400 frames (8s)
+    // amortizes the larger model's fixed cost over enough audio to stay realtime.
+    const windowFrames = options.windowFrames ?? 400;
+    // Must comfortably exceed windowFrames: frames keep arriving in real time while one
+    // window is transcribing, so the buffer needs headroom for windowFrames worth of
+    // ramp-up plus the frames that land during a single (possibly slow) transcribe call.
+    const maxBufferedFrames = options.maxBufferedFrames ?? 800;
+    const transcribeTimeoutMs = options.transcribeTimeoutMs ?? 30_000;
     let loadAbort = new AbortController();
     let active;
     let commandQueue = Promise.resolve();
@@ -26,11 +38,37 @@ export function createWorkerController(runtime, post, options = {}) {
         }
         return samples;
     };
+    const runTranscribe = (session, samples, language) => {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new TranscribeTimeoutError("Local transcription timed out")), transcribeTimeoutMs);
+            runtime.transcribe(samples, session.abort.signal, language).then((result) => { clearTimeout(timer); resolve(result); }, (error) => { clearTimeout(timer); reject(error); });
+        });
+    };
     const transcribe = async (session, frames, isFinal) => {
         if (frames.length === 0 || session.terminal)
             return;
         const started = now();
-        const result = await runtime.transcribe(convert(frames), session.abort.signal);
+        let result;
+        try {
+            // Whisper's `language` hint takes a bare ISO 639-1 code (e.g. "en"), not a
+            // BCP-47 tag, so trim the region subtag off the primary candidate language.
+            const language = session.request.candidateLanguages[0].split("-")[0].toLowerCase();
+            result = await runTranscribe(session, convert(frames), language);
+        }
+        catch (error) {
+            if (session.terminal || session.abort.signal.aborted)
+                return;
+            session.terminal = true;
+            session.abort.abort();
+            emit(session, {
+                type: "error",
+                code: error instanceof TranscribeTimeoutError ? "TIMEOUT" : "INTERNAL",
+                fatal: true,
+                message: error instanceof Error ? error.message : "Local transcription failed",
+            });
+            emitState(session, "stopped");
+            return;
+        }
         if (session.terminal || session.abort.signal.aborted)
             return;
         const elapsed = now() - started;
@@ -167,12 +205,15 @@ async function createTransformersRuntime() {
                 throw new DOMException("Aborted", "AbortError");
             onProgress(1);
         },
-        async transcribe(samples, signal) {
+        async transcribe(samples, signal, language) {
             if (!pipeline)
                 throw new Error("Whisper model is not loaded");
             if (signal.aborted)
                 throw new DOMException("Aborted", "AbortError");
-            const output = await pipeline(samples);
+            // num_beams: 1 -> greedy decoding (fastest). task: "transcribe" -> never translate,
+            // matching this app's "keep spoken text as-is" design. language hints the decoder
+            // with the user's selected primary language instead of paying for auto-detection.
+            const output = await pipeline(samples, { num_beams: 1, language, task: "transcribe" });
             const timestamp = output.chunks?.[0]?.timestamp;
             return { text: output.text, startMs: (timestamp?.[0] ?? 0) * 1000, endMs: (timestamp?.[1] ?? samples.length / 16000) * 1000 };
         },

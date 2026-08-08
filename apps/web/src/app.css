@@ -80,6 +80,8 @@ button { font: inherit; }
 .control-button:not(:disabled):hover { background: rgb(255 255 255 / 11%); transform: translateY(-1px); }
 .control-button:focus-visible { outline: 2px solid #8fb4ff; outline-offset: 3px; }
 .control-button:disabled { cursor: not-allowed; opacity: .55; }
+.control-button[aria-pressed="true"] { background: rgb(143 180 255 / 22%); border-color: #8fb4ff; color: #eaf1ff; }
+.control-button[aria-pressed="true"]:not(:disabled):hover { background: rgb(143 180 255 / 30%); }
 
 .console-meta { display: flex; flex-direction: column; gap: 10px; margin-top: auto; }
 .status { display: flex; align-items: center; gap: 9px; color: #9aa7c2; font-family: 'Space Mono', monospace; font-size: 12px; }

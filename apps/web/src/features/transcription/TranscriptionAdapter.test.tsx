@@ -21,7 +21,9 @@ type EventWithoutSession<E extends EngineEvent = EngineEvent> = E extends Engine
 class ControlledSession implements TranscriptionSession {
   private readonly listeners = new Set<EngineEventListener>();
   public readonly frames: PcmFrame[] = [];
-  public stop = vi.fn(async () => undefined);
+  public stop = vi.fn(async () => {
+    this.emit({ type: "state", sequence: 1, state: "stopped" });
+  });
   public cancel = vi.fn(async () => undefined);
   public rejectNextFrame = false;
   public sessionId = "session-under-test";
@@ -110,6 +112,49 @@ describe("TranscriptionAdapter", () => {
     await waitFor(() => expect(engine.session.stop).toHaveBeenCalledTimes(1));
   });
 
+  it("reuses the same engine across stop and start instead of reloading the model on every recording", async () => {
+    const engine = new ControlledEngine();
+    const factory = vi.fn(() => engine);
+    const microphone = vi.fn(async () => ({ stop: vi.fn(async () => undefined) }));
+    render(<TranscriptionAdapter engineFactory={factory} microphoneFactory={microphone} initialLanguages={[]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(engine.open).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(engine.session.stop).toHaveBeenCalledTimes(1));
+    expect(engine.dispose).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(engine.open).toHaveBeenCalledTimes(2));
+
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(engine.prepare).toHaveBeenCalledTimes(2);
+    expect(engine.dispose).not.toHaveBeenCalled();
+  });
+
+  it("stopping while the model is still preparing cancels the pending start instead of going live", async () => {
+    const engine = new ControlledEngine();
+    let resolvePrepare: () => void = () => undefined;
+    engine.prepare.mockImplementation(() => new Promise<undefined>((resolve) => { resolvePrepare = () => resolve(undefined); }));
+    const { microphone } = renderAdapter({ engine });
+
+    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    expect(await screen.findByText("Preparing local model…")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(screen.getByRole("status")).toHaveTextContent("Standby");
+    expect(screen.queryByText("Preparing local model…")).not.toBeInTheDocument();
+
+    resolvePrepare();
+    await waitFor(() => expect(engine.dispose).toHaveBeenCalled());
+    expect(engine.open).not.toHaveBeenCalled();
+    expect(microphone).not.toHaveBeenCalled();
+    expect(screen.getByRole("status")).toHaveTextContent("Standby");
+  });
+
   it("renders provisional and final segments with language badges and model progress", async () => {
     const { engine } = renderAdapter();
     fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
@@ -191,7 +236,7 @@ describe("TranscriptionAdapter engine selection", () => {
 
     await waitFor(() => expect(localEngine.open).toHaveBeenCalledTimes(1));
     expect(mockCreateEngine).toHaveBeenCalledTimes(1);
-    expect(mockCreateEngine).toHaveBeenCalledWith({ kind: "local", cloudConsent: false, websocketUrl: "wss://api.test/transcribe" });
+    expect(mockCreateEngine).toHaveBeenCalledWith({ kind: "local", cloudConsent: false, websocketUrl: "wss://api.test/transcribe", onProgress: expect.any(Function) });
   });
 
   it("only constructs the cloud (browser) client after explicit consent, never a local engine", async () => {
@@ -207,7 +252,7 @@ describe("TranscriptionAdapter engine selection", () => {
     await waitFor(() => expect(cloudEngine.open).toHaveBeenCalledTimes(1));
     expect(localEngine.open).not.toHaveBeenCalled();
     expect(mockCreateEngine).toHaveBeenCalledTimes(1);
-    expect(mockCreateEngine).toHaveBeenCalledWith({ kind: "cloud", cloudConsent: true, websocketUrl: "wss://api.test/transcribe" });
+    expect(mockCreateEngine).toHaveBeenCalledWith({ kind: "cloud", cloudConsent: true, websocketUrl: "wss://api.test/transcribe", onProgress: expect.any(Function) });
   });
 
   it("never attempts the cloud engine before consent is given", () => {

@@ -107,4 +107,40 @@ describe("worker controller", () => {
     await Promise.all(pushes);
     expect(events.filter((event) => event.type === "event" && event.event.type === "segment.upsert").map((event) => (event as Extract<WorkerEvent, { type: "event" }>).event.segment.revision)).toEqual([1, 2, 3]);
   });
+
+  it("surfaces a fatal error and stops the session when transcription rejects", async () => {
+    const events: WorkerEvent[] = [];
+    const controller = createWorkerController({
+      load: async () => undefined,
+      transcribe: async () => { throw new Error("inference crashed"); },
+      dispose: async () => undefined,
+    }, (event) => events.push(event), { windowFrames: 1 });
+    const request = makeSessionRequest(["en-US"]);
+    await controller.handle({ type: "prepare", requestId: 1, device: "wasm" });
+    await controller.handle({ type: "open", request });
+    await controller.handle({ type: "push", sessionId: request.sessionId, frame: makePcmFrame(0) });
+
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "event", event: expect.objectContaining({ type: "error", fatal: true, code: "INTERNAL", message: "inference crashed" }) }),
+      expect.objectContaining({ type: "event", event: expect.objectContaining({ type: "state", state: "stopped" }) }),
+    ]));
+  });
+
+  it("surfaces a fatal timeout error and stops the session when transcription hangs", async () => {
+    const events: WorkerEvent[] = [];
+    const controller = createWorkerController({
+      load: async () => undefined,
+      transcribe: () => new Promise(() => { /* never resolves, simulating a hung inference call */ }),
+      dispose: async () => undefined,
+    }, (event) => events.push(event), { windowFrames: 1, transcribeTimeoutMs: 20 });
+    const request = makeSessionRequest(["en-US"]);
+    await controller.handle({ type: "prepare", requestId: 1, device: "wasm" });
+    await controller.handle({ type: "open", request });
+    await controller.handle({ type: "push", sessionId: request.sessionId, frame: makePcmFrame(0) });
+
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "event", event: expect.objectContaining({ type: "error", fatal: true, code: "TIMEOUT" }) }),
+      expect.objectContaining({ type: "event", event: expect.objectContaining({ type: "state", state: "stopped" }) }),
+    ]));
+  });
 });

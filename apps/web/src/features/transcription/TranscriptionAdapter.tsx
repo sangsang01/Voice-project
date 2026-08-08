@@ -22,6 +22,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
   const [localError, setLocalError] = useState<string>();
   const [backpressureWarning, setBackpressureWarning] = useState<string>();
   const [starting, setStarting] = useState(false);
+  const [loadProgress, setLoadProgress] = useState<number>();
   const [cloudDialogOpen, setCloudDialogOpen] = useState(false);
   const [engineKind, setEngineKind] = useState<EngineKind>("local");
   const [now, setNow] = useState(() => new Date());
@@ -42,6 +43,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
         kind: engineKindRef.current,
         cloudConsent: engineKindRef.current === "cloud",
         websocketUrl,
+        onProgress: setLoadProgress,
       })),
       microphoneFactory,
       onLocalError: setLocalError,
@@ -58,6 +60,13 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
     return () => window.clearInterval(clock);
   }, []);
 
+  // The controller caches its engine across start/stop cycles so a prepared model
+  // doesn't reload on every recording -- but that cached engine is the wrong kind
+  // once the user switches between local and cloud, so drop it here instead.
+  useEffect(() => {
+    void controller?.resetEngine();
+  }, [engineKind, controller]);
+
   const error = selectionError ?? localError ?? state.fatalError?.message;
   const listening = !error && (starting || state.engineState === "listening" || state.engineState === "draining");
   const hasValidSelection = candidateLanguages.length >= 1 && candidateLanguages.length <= 4 && new Set(candidateLanguages).size === candidateLanguages.length;
@@ -67,7 +76,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
   };
   const run = async (operation: () => Promise<unknown>) => {
     if (!hasValidSelection) { setSelectionError("Select between 1 and 4 unique languages"); return; }
-    setSelectionError(undefined); setLocalError(undefined); setBackpressureWarning(undefined); setStarting(true);
+    setSelectionError(undefined); setLocalError(undefined); setBackpressureWarning(undefined); setLoadProgress(undefined); setStarting(true);
     try { await operation(); } catch { /* controller emits the normalized local error */ } finally { setStarting(false); }
   };
 
@@ -78,7 +87,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
           <header className="console-title"><p>Voice console</p><h1>Earth Assistant</h1></header>
           <div aria-label="Candidate languages">{LANGUAGES.map(([tag, label]) => <button aria-pressed={candidateLanguages.includes(tag)} className="control-button" key={tag} onClick={() => toggleLanguage(tag)} type="button">{label}</button>)}</div>
           <button className="control-button" disabled={!controller || listening} onClick={() => controller && void run(() => controller.start(candidateLanguages))} type="button">Start</button>
-          <button className="control-button" disabled={!controller || !listening} onClick={() => controller && void controller.stop()} type="button">Stop</button>
+          <button className="control-button" disabled={!controller || !listening} onClick={() => { setStarting(false); setLoadProgress(undefined); if (controller) void controller.stop(); }} type="button">Stop</button>
           <button className="control-button" disabled={!controller} onClick={() => controller && void run(() => controller.clearAndRestart(candidateLanguages))} type="button">Clear &amp; Restart</button>
           <button className="control-button" disabled={listening} onClick={() => engineKind === "cloud" ? setEngineKind("local") : setCloudDialogOpen(true)} type="button">{engineKind === "cloud" ? "Switch to local transcription" : "Use cloud transcription"}</button>
           <div className="console-meta"><p aria-atomic="true" aria-live="polite" className="status" role="status"><span className={`status-dot${listening ? " status-dot--listening" : ""}`} aria-hidden="true" />{listening ? "Listening" : "Standby"}</p><p className="engine-mode">{engineKind === "cloud" ? "Cloud transcription (consented)" : "Local transcription (on this device)"}</p><p className="clock">Local {formatClock(now, false)} · UTC {formatClock(now, true)}</p></div>
@@ -87,7 +96,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
           <EarthGlobe listening={listening} />
           <div className="transcript" aria-live="polite">
             {state.segments.length === 0 ? <span>Press Start and speak — your words appear here.</span> : state.segments.map((segment) => <p key={segment.id}><span>{segment.text}</span> <small>{segment.language.tag}</small></p>)}
-            {starting && <p>Preparing local model…</p>}
+            {starting && <p>Preparing local model{loadProgress === undefined ? "…" : ` ${Math.round(loadProgress * 100)}%`}</p>}
             {state.warnings.map((warning, index) => <p key={`${warning.code}-${index}`}>{warning.message}</p>)}
             {backpressureWarning && <p>{backpressureWarning}</p>}
           </div>

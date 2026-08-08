@@ -1,7 +1,8 @@
 import { LOCAL_MODEL } from "../modelManifest.js";
 export { LOCAL_MODEL };
 export const MODEL_CACHE_KEY = "local-whisper-model";
-export const DEFAULT_MODEL_STORAGE_BYTES = 300 * 1024 * 1024;
+// whisper-small (q8, encoder + decoder) is ~240MB on disk; leave headroom above that.
+export const DEFAULT_MODEL_STORAGE_BYTES = 400 * 1024 * 1024;
 function expectedMetadata(complete) {
     return {
         modelId: LOCAL_MODEL.id,

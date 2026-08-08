@@ -122,7 +122,9 @@ export class LocalWhisperEngine {
             throw new Error("engine must be prepared before opening a session");
         if (this.activeSession && !this.activeSession.isTerminal)
             throw new Error("an active local Whisper session already exists");
-        const session = new LocalSession(valid, this.worker, this.options.maxBufferedFrames ?? 50);
+        // Mirrors the worker's own default (see localWhisper.worker.ts) so the main-thread
+        // flow-control cap doesn't trip before the worker's first transcription window fills.
+        const session = new LocalSession(valid, this.worker, this.options.maxBufferedFrames ?? 800);
         this.activeSession = session;
         this.worker.postMessage({ type: "open", request: valid });
         return session;

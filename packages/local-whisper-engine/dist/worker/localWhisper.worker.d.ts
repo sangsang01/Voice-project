@@ -4,7 +4,7 @@ export interface WhisperRuntime {
         device: InferenceDevice;
         onProgress(progress: number): void;
     }, signal: AbortSignal): Promise<void>;
-    transcribe(samples: Float32Array, signal: AbortSignal): Promise<{
+    transcribe(samples: Float32Array, signal: AbortSignal, language: string): Promise<{
         text: string;
         startMs: number;
         endMs: number;
@@ -15,6 +15,7 @@ interface WorkerControllerOptions {
     now?: () => number;
     maxBufferedFrames?: number;
     windowFrames?: number;
+    transcribeTimeoutMs?: number;
 }
 export declare function createWorkerController(runtime: WhisperRuntime, post: (event: WorkerEvent) => void, options?: WorkerControllerOptions): {
     handle(message: MainToWorker): Promise<void>;
