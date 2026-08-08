@@ -1,0 +1,51 @@
+/**
+ * Type declaration for the whisper.cpp WASM bridge build output.
+ *
+ * `whisper-bridge.js` / `whisper-bridge.wasm` are NOT checked in yet -- they
+ * are produced by `npm run build:wasm` (see native/CMakeLists.txt and
+ * scripts/build-wasm.mjs), which requires an Emscripten toolchain this
+ * repo does not assume is installed. This declaration exists purely so
+ * `bridgeRuntime.ts` can typecheck against the seam; nothing here executes
+ * until the real build is committed alongside it.
+ *
+ * The shape matches Emscripten's `-s MODULARIZE=1 -s EXPORT_ES6=1` output:
+ * the default export is a factory that returns a promise for the
+ * initialised module (optionally taking a partial module for overrides such
+ * as `locateFile`), and the embind class declared in native/bridge.cpp
+ * (`EMSCRIPTEN_BINDINGS(whisper_bridge)`) shows up as `WhisperBridge` on
+ * that module.
+ */
+
+export interface WhisperBridgeTranscribeResult {
+  text: string;
+  language: string;
+  languageProbability: number;
+}
+
+export interface WhisperBridgeInstance {
+  init(modelPtr: number, modelLen: number, vadPath: string, nThreads: number): boolean;
+  vadProbs(samplesPtr: number, sampleCount: number): number;
+  probsPtr(): number;
+  vadReset(): void;
+  transcribe(
+    samplesPtr: number,
+    sampleCount: number,
+    nThreads: number,
+  ): WhisperBridgeTranscribeResult;
+  release(): void;
+}
+
+export interface WhisperBridgeModule {
+  _malloc(bytes: number): number;
+  _free(pointer: number): void;
+  HEAPU8: Uint8Array;
+  HEAPF32: Float32Array;
+  FS: { writeFile(path: string, data: Uint8Array): void };
+  WhisperBridge: new () => WhisperBridgeInstance;
+}
+
+declare function createWhisperBridgeModule(
+  moduleOverrides?: Partial<WhisperBridgeModule>,
+): Promise<WhisperBridgeModule>;
+
+export default createWhisperBridgeModule;
