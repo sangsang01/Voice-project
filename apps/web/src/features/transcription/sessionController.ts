@@ -38,7 +38,7 @@ export class SessionController {
   // Kept across start/stop cycles: engine.prepare() is idempotent once already
   // prepared, so reusing the same engine means the model only ever loads once
   // per page session instead of being reloaded from scratch on every recording.
-  // Only torn down by dispose() (unmount) or resetEngine() (engine kind switch).
+  // Only torn down by dispose() (unmount).
   private engine: TranscriptionEngine | undefined;
   // Bumped by stop()/clear() so a startWithId() call already in flight (e.g. still
   // downloading the model) can detect it was cancelled and discard its result
@@ -85,11 +85,6 @@ export class SessionController {
 
   public async dispose(): Promise<void> {
     await this.clear();
-    await this.dropEngine();
-  }
-
-  /** Discards the cached engine so the next start() builds a fresh one -- call when switching between local/cloud. */
-  public async resetEngine(): Promise<void> {
     await this.dropEngine();
   }
 

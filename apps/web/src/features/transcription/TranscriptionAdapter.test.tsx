@@ -7,12 +7,8 @@ import type {
   TranscriptionEngine,
   TranscriptionSession,
 } from "@voice/transcription-contracts";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createTranscriptionEngine } from "./engineFactory";
+import { describe, expect, it, vi } from "vitest";
 import { TranscriptionAdapter } from "./TranscriptionAdapter";
-
-vi.mock("./engineFactory", () => ({ createTranscriptionEngine: vi.fn() }));
-const mockCreateEngine = vi.mocked(createTranscriptionEngine);
 
 type EventWithoutSession<E extends EngineEvent = EngineEvent> = E extends EngineEvent
   ? Omit<E, "sessionId">
@@ -200,87 +196,11 @@ describe("TranscriptionAdapter", () => {
     expect(screen.queryByText("stale")).not.toBeInTheDocument();
   });
 
-  it("shows local microphone failures and requires explicit consent before cloud use", async () => {
+  it("shows local microphone failures", async () => {
     renderAdapter({ failMicrophone: true });
     fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Microphone permission was denied");
     expect(screen.getByRole("status")).toHaveTextContent("Standby");
-
-    fireEvent.click(screen.getByRole("button", { name: "Use cloud transcription" }));
-    expect(screen.getByRole("dialog")).toHaveTextContent("Cloud transcription sends audio off this device");
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-});
-
-describe("TranscriptionAdapter engine selection", () => {
-  const fakeMicrophone = vi.fn(async () => ({ stop: vi.fn(async () => undefined) }));
-
-  beforeEach(() => {
-    mockCreateEngine.mockReset();
-    fakeMicrophone.mockClear();
-  });
-
-  function selectEnglishAndStart() {
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
-    fireEvent.click(screen.getByRole("button", { name: "Start" }));
-  }
-
-  it("uses the local engine by default, without any consent", async () => {
-    const localEngine = new ControlledEngine();
-    mockCreateEngine.mockReturnValue(localEngine);
-
-    render(<TranscriptionAdapter initialLanguages={[]} microphoneFactory={fakeMicrophone} websocketUrl="wss://api.test/transcribe" />);
-    selectEnglishAndStart();
-
-    await waitFor(() => expect(localEngine.open).toHaveBeenCalledTimes(1));
-    expect(mockCreateEngine).toHaveBeenCalledTimes(1);
-    expect(mockCreateEngine).toHaveBeenCalledWith({ kind: "local", cloudConsent: false, websocketUrl: "wss://api.test/transcribe", onProgress: expect.any(Function) });
-  });
-
-  it("only constructs the cloud (browser) client after explicit consent, never a local engine", async () => {
-    const localEngine = new ControlledEngine();
-    const cloudEngine = new ControlledEngine();
-    mockCreateEngine.mockImplementation(({ kind }) => (kind === "cloud" ? cloudEngine : localEngine));
-
-    render(<TranscriptionAdapter initialLanguages={[]} microphoneFactory={fakeMicrophone} websocketUrl="wss://api.test/transcribe" />);
-    fireEvent.click(screen.getByRole("button", { name: "Use cloud transcription" }));
-    fireEvent.click(screen.getByRole("button", { name: "I consent to cloud transcription" }));
-    selectEnglishAndStart();
-
-    await waitFor(() => expect(cloudEngine.open).toHaveBeenCalledTimes(1));
-    expect(localEngine.open).not.toHaveBeenCalled();
-    expect(mockCreateEngine).toHaveBeenCalledTimes(1);
-    expect(mockCreateEngine).toHaveBeenCalledWith({ kind: "cloud", cloudConsent: true, websocketUrl: "wss://api.test/transcribe", onProgress: expect.any(Function) });
-  });
-
-  it("never attempts the cloud engine before consent is given", () => {
-    const localEngine = new ControlledEngine();
-    mockCreateEngine.mockReturnValue(localEngine);
-
-    render(<TranscriptionAdapter initialLanguages={[]} microphoneFactory={fakeMicrophone} />);
-    fireEvent.click(screen.getByRole("button", { name: "Use cloud transcription" }));
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    selectEnglishAndStart();
-
-    expect(mockCreateEngine).not.toHaveBeenCalledWith(expect.objectContaining({ kind: "cloud" }));
-  });
-
-  it("shows a visible error and stays stopped when the cloud engine fails to open, without silently falling back to another provider", async () => {
-    const localEngine = new ControlledEngine();
-    const cloudEngine = new ControlledEngine();
-    cloudEngine.open.mockRejectedValueOnce(new Error("cloud transcription requires explicit user consent"));
-    mockCreateEngine.mockImplementation(({ kind }) => (kind === "cloud" ? cloudEngine : localEngine));
-
-    render(<TranscriptionAdapter initialLanguages={[]} microphoneFactory={fakeMicrophone} websocketUrl="wss://api.test/transcribe" />);
-    fireEvent.click(screen.getByRole("button", { name: "Use cloud transcription" }));
-    fireEvent.click(screen.getByRole("button", { name: "I consent to cloud transcription" }));
-    selectEnglishAndStart();
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("cloud transcription requires explicit user consent");
-    expect(screen.getByRole("status")).toHaveTextContent("Standby");
-    expect(localEngine.open).not.toHaveBeenCalled();
-    expect(mockCreateEngine).toHaveBeenCalledTimes(1);
   });
 });
