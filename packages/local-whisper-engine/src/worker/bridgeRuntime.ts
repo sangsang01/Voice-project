@@ -1,5 +1,9 @@
 import { loadModelAsset } from "../cache/modelAssets.js";
 import { LOCAL_MODEL } from "../modelManifest.js";
+import type {
+  WhisperBridgeInstance,
+  WhisperBridgeModule,
+} from "../../wasm/whisper-bridge.js";
 
 export interface TranscribeResult {
   text: string;
@@ -19,23 +23,11 @@ export interface WhisperRuntime {
   dispose(): Promise<void>;
 }
 
-interface BridgeModule {
-  _malloc(bytes: number): number;
-  _free(pointer: number): void;
-  HEAPU8: Uint8Array;
-  HEAPF32: Float32Array;
-  FS: { writeFile(path: string, data: Uint8Array): void };
-  WhisperBridge: new () => BridgeInstance;
-}
-
-interface BridgeInstance {
-  init(modelPtr: number, modelLen: number, vadPath: string, nThreads: number): boolean;
-  vadProbs(samplesPtr: number, sampleCount: number): number;
-  probsPtr(): number;
-  vadReset(): void;
-  transcribe(samplesPtr: number, sampleCount: number, nThreads: number): TranscribeResult;
-  release(): void;
-}
+// BridgeModule/BridgeInstance are imported directly from wasm/whisper-bridge.d.ts
+// (as WhisperBridgeModule/WhisperBridgeInstance) rather than redeclared here,
+// so a signature change in that .d.ts (which itself must track native/bridge.cpp)
+// is caught by the typechecker at this call site instead of silently drifting
+// behind a same-shaped local copy.
 
 const VAD_MEMFS_PATH = "/silero.bin";
 
@@ -47,8 +39,8 @@ function threadCount(): number {
 }
 
 export function createBridgeRuntime(): WhisperRuntime {
-  let module: BridgeModule | undefined;
-  let bridge: BridgeInstance | undefined;
+  let module: WhisperBridgeModule | undefined;
+  let bridge: WhisperBridgeInstance | undefined;
   let samplesPtr = 0;
   let samplesCapacity = 0;
 
@@ -81,9 +73,13 @@ export function createBridgeRuntime(): WhisperRuntime {
     async load({ onProgress }, signal) {
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
 
-      const factory = (await import("../../wasm/whisper-bridge.js")) as unknown as {
-        default: () => Promise<BridgeModule>;
-      };
+      // No cast needed: the dynamic import()'s type comes straight from
+      // wasm/whisper-bridge.d.ts (its default export is typed as
+      // `() => Promise<WhisperBridgeModule>`), so `factory.default()`
+      // already resolves to `WhisperBridgeModule` and this stays a live
+      // typecheck against that seam rather than an `as unknown as` escape
+      // hatch that would hide drift if the .d.ts changes later.
+      const factory = await import("../../wasm/whisper-bridge.js");
       module = await factory.default();
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
 
@@ -104,8 +100,22 @@ export function createBridgeRuntime(): WhisperRuntime {
       module.HEAPU8.set(new Uint8Array(weights), modelPtr);
 
       bridge = new module.WhisperBridge();
-      if (!bridge.init(modelPtr, weights.byteLength, VAD_MEMFS_PATH, threadCount())) {
+      let initialised = false;
+      try {
+        initialised = bridge.init(modelPtr, weights.byteLength, VAD_MEMFS_PATH, threadCount());
+      } finally {
+        // whisper.cpp copies the model bytes into its own ggml tensor
+        // allocations while loading (vendor/whisper.cpp/src/whisper.cpp:3668-3703,
+        // memcpy(output, buf->buffer + buf->current_offset, size_to_copy)) and
+        // keeps no reference to modelPtr afterward. So modelPtr is dead the
+        // instant init() returns -- on success as much as on failure -- and
+        // nothing else in this module ever frees it (dispose() only frees
+        // samplesPtr). Free it unconditionally here, in a finally, so every
+        // exit from init() (success, `false`, or a thrown error) reclaims the
+        // ~31MB buffer instead of leaking it for the lifetime of the module.
         module._free(modelPtr);
+      }
+      if (!initialised) {
         bridge = undefined;
         throw new Error("Failed to initialise the whisper.cpp bridge.");
       }
