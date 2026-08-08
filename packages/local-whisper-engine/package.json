@@ -12,8 +12,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",
-    "@voice/transcription-contracts": "0.0.0",
-    "franc-min": "^6.2.0"
+    "@voice/transcription-contracts": "0.0.0"
   },
   "devDependencies": {
     "typescript": "6.0.3",

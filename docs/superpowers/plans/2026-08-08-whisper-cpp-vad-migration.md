@@ -2636,8 +2636,11 @@ Then commit the regenerated files.
 
 - [ ] **Step 4: Delete the stale planning docs**
 
+`docs/agent-tasks/` is tracked; `report/` is untracked, so `git rm` would fail on it:
+
 ```bash
-git rm -r docs/agent-tasks report
+git rm -r docs/agent-tasks
+rm -rf report
 ```
 
 - [ ] **Step 5: Verify the whole repo**
