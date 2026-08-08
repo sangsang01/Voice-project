@@ -130,4 +130,45 @@ describe("createVadGate", () => {
     gate.reset();
     expect(gate.flushPending(5000)).toEqual({ type: "idle" });
   });
+
+  it("ends a stop-triggered flush at the last voiced window, not at nowMs", () => {
+    const gate = createVadGate();
+    const speechWindows = windowsFor(VAD_DEFAULTS.minSpeechMs) + 2;
+    feed(gate, 0.9, speechWindows);
+    const lastVoiceEndMs = speechWindows * WINDOW;
+
+    // Trailing silence stays under minSilenceMs, so push() never flushes on its own.
+    const silenceWindows = windowsFor(VAD_DEFAULTS.minSilenceMs) - 2;
+    const silence = feed(gate, 0.1, silenceWindows, speechWindows);
+    expect(silence.every((decision) => decision.type !== "flush")).toBe(true);
+
+    // Stop is called well after the last voiced window.
+    const nowMs = lastVoiceEndMs + silenceWindows * WINDOW + 10_000;
+    const decision = gate.flushPending(nowMs);
+
+    expect(decision).toMatchObject({ type: "flush", reason: "silence" });
+    if (decision.type !== "flush") throw new Error("expected a flush");
+    // The flush must end at the last voiced window plus the pad -- NOT at
+    // nowMs -- otherwise trailing silence leaks into the transcribed audio.
+    expect(decision.endMs).toBe(lastVoiceEndMs + VAD_DEFAULTS.speechPadMs);
+  });
+
+  it("chains a second max-duration flush when the monologue keeps going", () => {
+    const gate = createVadGate();
+    const total = windowsFor(2 * VAD_DEFAULTS.maxSpeechMs) + 5;
+    const decisions = feed(gate, 0.9, total);
+
+    const flushes = decisions.filter((decision) => decision.type === "flush");
+    expect(flushes).toHaveLength(2);
+    const [first, second] = flushes;
+    if (first?.type !== "flush" || second?.type !== "flush") throw new Error("expected two flushes");
+    expect(first.reason).toBe("max-duration");
+    expect(second.reason).toBe("max-duration");
+    expect(second.startMs).toBeGreaterThan(first.startMs);
+    expect(second.endMs).toBeGreaterThan(first.endMs);
+
+    // Still mid-speech after the second cut, so the gate keeps listening
+    // instead of stalling after the first chained utterance.
+    expect(decisions.at(-1)).toEqual({ type: "speaking" });
+  });
 });

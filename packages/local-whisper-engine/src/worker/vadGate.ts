@@ -108,11 +108,16 @@ export function createVadGate(overrides: Partial<VadGateConfig> = {}): VadGate {
     },
 
     flushPending(nowMs) {
+      // nowMs is deliberately ignored: the utterance ends at the last VOICED
+      // window, not at whenever the caller happened to call stop(), so
+      // trailing silence between the last speech and the stop is never sent
+      // to Whisper. Kept in the signature -- a later task already calls it.
+      void nowMs;
       if (!speaking) {
         reset();
         return IDLE;
       }
-      const decision = utterance(Math.max(lastVoiceEndMs, nowMs), "silence");
+      const decision = utterance(lastVoiceEndMs, "silence");
       reset();
       return decision;
     },
