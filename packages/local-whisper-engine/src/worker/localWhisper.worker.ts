@@ -12,6 +12,7 @@ interface WorkerControllerOptions {
   maxBufferedFrames?: number;
   maxPendingUtterances?: number;
   vad?: Partial<VadGateConfig>;
+  transcribeTimeoutMs?: number;
 }
 
 interface ActiveSession {
@@ -41,6 +42,11 @@ const FRAME_SAMPLES = 320;
 const VAD_WINDOW_SAMPLES = 512;
 const SAMPLE_RATE = 16_000;
 
+type TranscribeResult = Awaited<ReturnType<WhisperRuntime["transcribe"]>>;
+
+/** Distinguishes a timed-out transcription from any other transcribe() rejection. */
+class TranscribeTimeoutError extends Error {}
+
 export function createWorkerController(
   runtime: WhisperRuntime,
   post: (event: WorkerEvent) => void,
@@ -48,9 +54,27 @@ export function createWorkerController(
 ) {
   const maxBufferedFrames = options.maxBufferedFrames ?? 3000;
   const maxPendingUtterances = options.maxPendingUtterances ?? 3;
+  const transcribeTimeoutMs = options.transcribeTimeoutMs ?? 30_000;
   let loadAbort = new AbortController();
   let active: ActiveSession | undefined;
   let commandQueue = Promise.resolve();
+
+  /**
+   * Races runtime.transcribe() against transcribeTimeoutMs. The WASM build has no GPU
+   * acceleration, so a pathologically slow or hung whisper_full() call is plausible, and
+   * without this the session would hang forever with no error and no "stopped" state.
+   * The timer is cleared on BOTH settle paths so a late-firing timer can never reject an
+   * already-resolved promise, and so it does not keep the event loop alive.
+   */
+  const runTranscribe = (session: ActiveSession, samples: Float32Array): Promise<TranscribeResult> => {
+    return new Promise<TranscribeResult>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new TranscribeTimeoutError("Local transcription timed out")), transcribeTimeoutMs);
+      runtime.transcribe(samples, session.abort.signal).then(
+        (result) => { clearTimeout(timer); resolve(result); },
+        (error) => { clearTimeout(timer); reject(error); },
+      );
+    });
+  };
 
   const emit = (session: ActiveSession, event: EventWithoutEnvelope) => {
     post({
@@ -112,7 +136,7 @@ export function createWorkerController(
 
     session.pending += 1;
     try {
-      const result = await runtime.transcribe(samples, session.abort.signal);
+      const result = await runTranscribe(session, samples);
       if (session.terminal || session.abort.signal.aborted) return;
 
       const text = result.text.trim();
@@ -136,7 +160,7 @@ export function createWorkerController(
       session.abort.abort();
       emit(session, {
         type: "error",
-        code: "INTERNAL",
+        code: error instanceof TranscribeTimeoutError ? "TIMEOUT" : "INTERNAL",
         fatal: true,
         message: error instanceof Error ? error.message : "Local transcription failed",
       });

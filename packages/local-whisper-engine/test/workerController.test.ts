@@ -185,4 +185,66 @@ describe("worker controller", () => {
     const errors = engineEvents(events).filter((event) => event.type === "error");
     expect(errors[0]).toMatchObject({ code: "INTERNAL", fatal: true });
   });
+
+  it("warns without transcribing when the pending-utterance backlog is full, and does not stop the session", async () => {
+    const { post, events } = collect();
+    const { runtime } = fakeRuntime();
+    const transcribe = vi.fn(runtime.transcribe);
+    // maxPendingUtterances: 0 is the smallest possible cap -- the backlog check runs
+    // before session.pending is ever incremented for the utterance about to start, so a
+    // cap of 0 always trips it, without needing genuinely concurrent transcriptions.
+    const controller = createWorkerController({ ...runtime, transcribe }, post, { maxPendingUtterances: 0 });
+
+    await controller.handle({ type: "prepare", requestId: 1 });
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 60; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    const warnings = engineEvents(events).filter((event) => event.type === "warning");
+    expect(warnings.some((event) => event.type === "warning" && event.code === "DEGRADED_PERFORMANCE")).toBe(true);
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(engineEvents(events).filter((event) => event.type === "segment.upsert")).toHaveLength(0);
+    const states = engineEvents(events).filter((event) => event.type === "state");
+    expect(states.some((event) => event.type === "state" && event.state === "stopped")).toBe(false);
+  });
+
+  it("times out a hung transcription as a fatal error, exactly once", async () => {
+    const { post, events } = collect();
+    const { runtime } = fakeRuntime({
+      transcribe: () => new Promise(() => { /* never resolves, simulating a hung whisper_full() call */ }),
+    });
+    const controller = createWorkerController(runtime, post, { transcribeTimeoutMs: 50 });
+
+    await controller.handle({ type: "prepare", requestId: 1 });
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 60; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    const errors = engineEvents(events).filter((event) => event.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ code: "TIMEOUT", fatal: true });
+    const states = engineEvents(events).filter((event) => event.type === "state");
+    expect(states.at(-1)).toMatchObject({ state: "stopped" });
+  });
+
+  it("does not spuriously time out after a fast transcription already completed", async () => {
+    const { post, events } = collect();
+    const { runtime } = fakeRuntime();
+    const controller = createWorkerController(runtime, post, { transcribeTimeoutMs: 50 });
+
+    await controller.handle({ type: "prepare", requestId: 1 });
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 60; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    // Sit past the timeout window: a leaked timer would have its best chance to fire here.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const segments = engineEvents(events).filter((event) => event.type === "segment.upsert");
+    expect(segments).toHaveLength(1);
+    expect(engineEvents(events).filter((event) => event.type === "error")).toHaveLength(0);
+  });
 });
