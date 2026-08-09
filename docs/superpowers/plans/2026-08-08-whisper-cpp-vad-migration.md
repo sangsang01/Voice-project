@@ -477,7 +477,7 @@ Expected: `wasm/whisper-bridge.js` and `wasm/whisper-bridge.wasm` are written.
 If emsdk is unavailable on this machine, use the official Docker image instead:
 
 ```bash
-docker run --rm -v "$PWD":/src -w /src emscripten/emsdk:latest \
+docker run --rm -v "$PWD":/src -w /src emscripten/emsdk:6.0.6@sha256:be96eff5810e42c632f3f8b795388a6b596e4fb21ec28b9e1fb1bc49bb3b1eef \
   node packages/local-whisper-engine/scripts/build-wasm.mjs
 ```
 
@@ -2560,7 +2560,7 @@ Currently pinned to **<tag from Task 3>**.
 No emsdk installed? Build in Docker:
 
 ```bash
-docker run --rm -v "$PWD":/src -w /src emscripten/emsdk:latest \
+docker run --rm -v "$PWD":/src -w /src emscripten/emsdk:6.0.6@sha256:be96eff5810e42c632f3f8b795388a6b596e4fb21ec28b9e1fb1bc49bb3b1eef \
   node packages/local-whisper-engine/scripts/build-wasm.mjs
 ```
 
