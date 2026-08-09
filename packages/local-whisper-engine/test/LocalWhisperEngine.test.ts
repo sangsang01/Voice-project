@@ -10,14 +10,22 @@ class FakeWorker implements WorkerLike {
   public readonly sent: unknown[] = [];
   public terminated = false;
   public terminateCalls = 0;
+  public nextPostError: Error | undefined;
+  public terminateError: Error | undefined;
 
   public postMessage(message: unknown): void {
+    if (this.nextPostError) {
+      const error = this.nextPostError;
+      this.nextPostError = undefined;
+      throw error;
+    }
     this.sent.push(message);
   }
 
   public terminate(): void {
-    this.terminated = true;
     this.terminateCalls += 1;
+    if (this.terminateError) throw this.terminateError;
+    this.terminated = true;
   }
 
   public emit(message: WorkerEvent): void {
@@ -76,6 +84,115 @@ describe("LocalWhisperEngine", () => {
     expect(workers[0]!.terminated).toBe(false);
     workers[0]!.emit({ type: "prepared", requestId: 1 });
     await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+  });
+
+  it("rolls back a failed open and recovers through a replacement worker", async () => {
+    const workers: FakeWorker[] = [];
+    const engine = new LocalWhisperEngine({ workerFactory: () => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    } });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    workers[0]!.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    workers[0]!.nextPostError = new DOMException("could not clone open request", "DataCloneError");
+
+    await expect(engine.open(request)).rejects.toThrow("could not clone open request");
+    expect(workers[0]!.terminateCalls).toBe(1);
+
+    const recovering = engine.prepare(request);
+    workers[1]!.emit({ type: "prepared", requestId: 2 });
+    await recovering;
+    await expect(engine.open(request)).resolves.toBeDefined();
+  });
+
+  it("fails a session coherently when posting a frame throws", async () => {
+    const worker = new FakeWorker();
+    const engine = new LocalWhisperEngine({ workerFactory: () => worker, maxBufferedFrames: 1 });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    worker.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const events: unknown[] = [];
+    session.subscribe((event) => events.push(event));
+    worker.nextPostError = new DOMException("could not clone audio frame", "DataCloneError");
+
+    expect(session.push(makePcmFrame(0))).toEqual({ accepted: false, reason: "backpressure" });
+
+    expect(worker.terminateCalls).toBe(1);
+    expect(events.slice(-2)).toEqual([
+      expect.objectContaining({ type: "error", code: "INTERNAL", fatal: true, message: "could not clone audio frame" }),
+      expect.objectContaining({ type: "state", state: "stopped" }),
+    ]);
+    expect(session.push(makePcmFrame(1))).toEqual({ accepted: false, reason: "backpressure" });
+  });
+
+  it("settles stop and terminalizes exactly once when posting stop throws", async () => {
+    const worker = new FakeWorker();
+    const engine = new LocalWhisperEngine({ workerFactory: () => worker });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    worker.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const events: unknown[] = [];
+    session.subscribe((event) => events.push(event));
+    worker.nextPostError = new Error("could not post stop");
+
+    const stopping = session.stop();
+    await expect(stopping).resolves.toBeUndefined();
+    await expect(session.stop()).resolves.toBeUndefined();
+
+    expect(worker.terminateCalls).toBe(1);
+    expect(events.filter((event) => (event as { type?: string }).type === "error")).toHaveLength(1);
+    expect(events.filter((event) => (event as { type?: string; state?: string }).type === "state" && (event as { state?: string }).state === "stopped")).toHaveLength(1);
+  });
+
+  it("preserves stopped cancellation semantics when posting cancel throws", async () => {
+    const worker = new FakeWorker();
+    const engine = new LocalWhisperEngine({ workerFactory: () => worker });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    worker.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const events: unknown[] = [];
+    session.subscribe((event) => events.push(event));
+    worker.nextPostError = new Error("could not post cancel");
+
+    await expect(session.cancel()).rejects.toThrow("could not post cancel");
+    await expect(session.cancel()).resolves.toBeUndefined();
+
+    expect(worker.terminateCalls).toBe(1);
+    expect(events.filter((event) => (event as { type?: string; state?: string }).type === "state" && (event as { state?: string }).state === "stopped")).toHaveLength(1);
+  });
+
+  it("surfaces combined cancel and termination failure after stopped cleanup", async () => {
+    const worker = new FakeWorker();
+    const engine = new LocalWhisperEngine({ workerFactory: () => worker });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    worker.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const events: unknown[] = [];
+    session.subscribe((event) => events.push(event));
+    worker.nextPostError = new Error("could not post cancel");
+    worker.terminateError = new Error("terminate was denied");
+
+    await expect(session.cancel()).rejects.toThrow(/could not post cancel.*terminate was denied/);
+
+    expect(events).toEqual([
+      expect.objectContaining({ type: "state", state: "stopped" }),
+    ]);
+    await expect(session.cancel()).resolves.toBeUndefined();
+    const recovering = engine.prepare(request);
+    expect(worker.terminateCalls).toBe(1);
+    worker.emit({ type: "prepared", requestId: 2 });
+    await expect(recovering).resolves.toBeUndefined();
   });
 
   it("relays preparation progress through the single local backend", async () => {
@@ -406,5 +523,147 @@ describe("LocalWhisperEngine", () => {
     await vi.advanceTimersByTimeAsync(100);
 
     expect(workers[1]!.terminated).toBe(false);
+  });
+
+  it("contains listener exceptions while watchdog failure completes and recovers", async () => {
+    vi.useFakeTimers();
+    const workers: FakeWorker[] = [];
+    const engine = new LocalWhisperEngine({
+      inferenceTimeoutMs: 50,
+      workerFactory: () => {
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker;
+      },
+    });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    workers[0]!.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const attempted: string[] = [];
+    const observed: string[] = [];
+    session.subscribe((event) => {
+      attempted.push(event.type === "state" ? `${event.type}:${event.state}` : event.type);
+      throw new Error("listener exploded");
+    });
+    session.subscribe((event) => {
+      observed.push(event.type === "state" ? `${event.type}:${event.state}` : event.type);
+    });
+    const stopping = session.stop();
+
+    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    await expect(vi.advanceTimersByTimeAsync(50)).resolves.toBeDefined();
+    await expect(stopping).resolves.toBeUndefined();
+
+    expect(attempted).toEqual(["error", "state:stopped"]);
+    expect(observed).toEqual(["error", "state:stopped"]);
+    expect(vi.getTimerCount()).toBe(0);
+    const recovering = engine.prepare(request);
+    workers[1]!.emit({ type: "prepared", requestId: 2 });
+    await expect(recovering).resolves.toBeUndefined();
+  });
+
+  it("contains listener exceptions while a worker crash completes and recovers", async () => {
+    const workers: FakeWorker[] = [];
+    const engine = new LocalWhisperEngine({ workerFactory: () => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    } });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    workers[0]!.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const attempted: string[] = [];
+    session.subscribe((event) => {
+      attempted.push(event.type === "state" ? `${event.type}:${event.state}` : event.type);
+      throw new Error("listener exploded");
+    });
+    const stopping = session.stop();
+
+    expect(() => workers[0]!.crash()).not.toThrow();
+    await expect(stopping).resolves.toBeUndefined();
+
+    expect(attempted).toEqual(["error", "state:stopped"]);
+    const recovering = engine.prepare(request);
+    workers[1]!.emit({ type: "prepared", requestId: 2 });
+    await expect(recovering).resolves.toBeUndefined();
+  });
+
+  it("continues queued-event replay after a listener throws", async () => {
+    const workers: FakeWorker[] = [];
+    const engine = new LocalWhisperEngine({ workerFactory: () => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    } });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    workers[0]!.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const stopping = session.stop();
+    workers[0]!.crash();
+    await expect(stopping).resolves.toBeUndefined();
+    const attempted: string[] = [];
+
+    expect(() => session.subscribe((event) => {
+      attempted.push(event.type === "state" ? `${event.type}:${event.state}` : event.type);
+      throw new Error("replay listener exploded");
+    })).not.toThrow();
+
+    expect(attempted).toEqual(["error", "state:stopped"]);
+    const recovering = engine.prepare(request);
+    workers[1]!.emit({ type: "prepared", requestId: 2 });
+    await expect(recovering).resolves.toBeUndefined();
+  });
+
+  it("surfaces termination failure without retaining a timed-out session", async () => {
+    vi.useFakeTimers();
+    const workers: FakeWorker[] = [];
+    const engine = new LocalWhisperEngine({
+      inferenceTimeoutMs: 50,
+      workerFactory: () => {
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker;
+      },
+    });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    workers[0]!.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const events: unknown[] = [];
+    session.subscribe((event) => events.push(event));
+    workers[0]!.terminateError = new Error("terminate was denied");
+
+    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(events.slice(-2)).toEqual([
+      expect.objectContaining({ type: "error", code: "TIMEOUT", message: expect.stringMatching(/terminate was denied/) }),
+      expect.objectContaining({ type: "state", state: "stopped" }),
+    ]);
+    expect(workers[0]!.terminateCalls).toBe(1);
+    const recovering = engine.prepare(request);
+    workers[1]!.emit({ type: "prepared", requestId: 2 });
+    await expect(recovering).resolves.toBeUndefined();
+  });
+
+  it("rejects disposal when termination throws but still settles preparation and clears handlers", async () => {
+    const worker = new FakeWorker();
+    worker.terminateError = new Error("terminate was denied");
+    const engine = new LocalWhisperEngine({ workerFactory: () => worker });
+    const preparing = engine.prepare(makeSessionRequest(["en-US"]));
+    const preparationOutcome = preparing.catch((error: unknown) => error);
+
+    await expect(engine.dispose()).rejects.toThrow("terminate was denied");
+    await expect(preparationOutcome).resolves.toEqual(expect.objectContaining({ message: "engine is disposed" }));
+    expect(worker.onmessage).toBeNull();
+    expect(worker.onerror).toBeNull();
+    await expect(engine.inspect()).resolves.toEqual({ available: false, reason: "disposed" });
   });
 });

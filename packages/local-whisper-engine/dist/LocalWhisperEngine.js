@@ -4,6 +4,7 @@ class LocalSession {
     request;
     worker;
     maxBufferedFrames;
+    onWorkerFailure;
     listeners = new Set();
     eventSequence = -1;
     terminal = false;
@@ -13,18 +14,25 @@ class LocalSession {
     buffered = 0;
     subscribed = false;
     pendingEvents = [];
-    constructor(request, worker, maxBufferedFrames) {
+    constructor(request, worker, maxBufferedFrames, onWorkerFailure) {
         this.request = request;
         this.worker = worker;
         this.maxBufferedFrames = maxBufferedFrames;
+        this.onWorkerFailure = onWorkerFailure;
     }
     push(frame) {
         if (this.terminal || this.closing || this.buffered >= this.maxBufferedFrames)
             return { accepted: false, reason: "backpressure" };
         const valid = validatePcmFrame(frame);
         const samples = valid.samples.slice();
+        try {
+            this.worker.postMessage({ type: "push", sessionId: this.request.sessionId, frame: { ...valid, samples } }, [samples.buffer]);
+        }
+        catch (error) {
+            this.onWorkerFailure(error);
+            return { accepted: false, reason: "backpressure" };
+        }
         this.buffered += 1;
-        this.worker.postMessage({ type: "push", sessionId: this.request.sessionId, frame: { ...valid, samples } }, [samples.buffer]);
         return { accepted: true };
     }
     stop() {
@@ -34,7 +42,12 @@ class LocalSession {
             return Promise.resolve();
         this.closing = true;
         this.stopping = new Promise((resolve) => { this.resolveStop = resolve; });
-        this.worker.postMessage({ type: "stop", sessionId: this.request.sessionId });
+        try {
+            this.worker.postMessage({ type: "stop", sessionId: this.request.sessionId });
+        }
+        catch (error) {
+            this.onWorkerFailure(error);
+        }
         return this.stopping;
     }
     async cancel() {
@@ -42,16 +55,26 @@ class LocalSession {
             return;
         this.closing = true;
         this.terminal = true;
-        this.worker.postMessage({ type: "cancel", sessionId: this.request.sessionId });
-        this.emit({ type: "state", sessionId: this.request.sessionId, sequence: this.eventSequence + 1, state: "stopped" });
-        this.resolveStop?.();
+        let failure;
+        try {
+            this.worker.postMessage({ type: "cancel", sessionId: this.request.sessionId });
+        }
+        catch (error) {
+            failure = this.onWorkerFailure(error);
+        }
+        finally {
+            this.emit({ type: "state", sessionId: this.request.sessionId, sequence: this.eventSequence + 1, state: "stopped" });
+            this.resolveStop?.();
+        }
+        if (failure)
+            throw failure;
     }
     subscribe(listener) {
         this.listeners.add(listener);
         if (!this.subscribed) {
             this.subscribed = true;
             for (const event of this.pendingEvents.splice(0))
-                listener(event);
+                this.notify(listener, event);
         }
         return () => this.listeners.delete(listener);
     }
@@ -91,7 +114,16 @@ class LocalSession {
             return;
         }
         for (const listener of this.listeners)
+            this.notify(listener, event);
+    }
+    notify(listener, event) {
+        try {
             listener(event);
+        }
+        catch {
+            // Listener failures are deliberately isolated and swallowed: the engine
+            // contract has no listener-error channel, and lifecycle cleanup must win.
+        }
     }
 }
 export class LocalWhisperEngine {
@@ -140,9 +172,16 @@ export class LocalWhisperEngine {
             throw new Error("an active local Whisper session already exists");
         // Mirrors the worker's own cap (see localWhisper.worker.ts): ~60s of audio at
         // 20ms per frame, which is well above the 25s longest possible utterance.
-        const session = new LocalSession(valid, this.worker, this.options.maxBufferedFrames ?? 3000);
+        const worker = this.worker;
+        const generation = this.workerGeneration;
+        const session = new LocalSession(valid, worker, this.options.maxBufferedFrames ?? 3000, (error) => this.handleSessionPostFailure(worker, generation, error));
         this.activeSession = session;
-        this.worker.postMessage({ type: "open", request: valid });
+        try {
+            worker.postMessage({ type: "open", request: valid });
+        }
+        catch (error) {
+            throw this.handleSessionPostFailure(worker, generation, error);
+        }
         return session;
     }
     async dispose() {
@@ -170,11 +209,17 @@ export class LocalWhisperEngine {
             worker.onerror = null;
             this.settlePrepare(worker, this.workerGeneration, new Error("engine is disposed"));
             this.worker = undefined;
+            let terminationFailure;
             try {
                 worker.terminate();
             }
-            catch {
-                // The engine is still terminal and all local references are cleared.
+            catch (error) {
+                terminationFailure = normalizeError(error, "failed to terminate local Whisper worker");
+            }
+            if (terminationFailure) {
+                this.worker = undefined;
+                this.preparing = undefined;
+                throw terminationFailure;
             }
         }
         else if (this.pendingPrepare) {
@@ -283,23 +328,31 @@ export class LocalWhisperEngine {
     }
     invalidateWorker(worker, generation, error, sessionFailure) {
         if (!this.isCurrentWorker(worker, generation))
-            return;
+            return error;
         this.prepared = false;
         this.clearInferenceWatchdog();
         worker.onmessage = null;
         worker.onerror = null;
         this.worker = undefined;
-        this.settlePrepare(worker, generation, error);
+        let surfacedError = error;
         try {
             worker.terminate();
         }
-        catch {
-            // The worker has already been detached and cannot affect engine state.
+        catch (terminationError) {
+            const normalized = normalizeError(terminationError, "failed to terminate local Whisper worker");
+            surfacedError = new Error(`${error.message}; failed to terminate local Whisper worker: ${normalized.message}`);
         }
+        this.settlePrepare(worker, generation, surfacedError);
         if (sessionFailure) {
-            this.activeSession?.fail(sessionFailure.code, sessionFailure.message);
+            const session = this.activeSession;
             this.activeSession = undefined;
+            session?.fail(sessionFailure.code, surfacedError === error ? sessionFailure.message : surfacedError.message);
         }
+        return surfacedError;
+    }
+    handleSessionPostFailure(worker, generation, error) {
+        const failure = normalizeError(error, "local Whisper worker communication failed");
+        return this.invalidateWorker(worker, generation, failure, { code: "INTERNAL", message: failure.message });
     }
     settlePrepare(worker, generation, error) {
         const pending = this.pendingPrepare;

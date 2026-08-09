@@ -34,6 +34,7 @@ export declare class LocalWhisperEngine implements TranscriptionEngine {
     private finishInferenceWatchdog;
     private handleInferenceTimeout;
     private invalidateWorker;
+    private handleSessionPostFailure;
     private settlePrepare;
     private clearInferenceWatchdog;
     private isCurrentWorker;
