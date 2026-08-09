@@ -114,16 +114,21 @@ describe("SessionController terminal event ownership", () => {
     const microphoneStop = vi.fn(
       () => new Promise<void>((resolve) => { resolveMicrophoneStop = resolve; }),
     );
+    const dispatch = vi.fn();
     const controller = new SessionController({
-      dispatch: vi.fn(),
+      dispatch,
       engineFactory: () => engine,
       microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
     });
     const sessionId = await controller.start(["en-US"]);
 
-    engine.emit({
+    const fatal: EngineEvent = {
       type: "error", sessionId, sequence: 1, code: "INTERNAL", fatal: true, message: "worker failed",
-    });
+    };
+    const stopped: EngineEvent = { type: "state", sessionId, sequence: 2, state: "stopped" };
+    dispatch.mockClear();
+    engine.emit(fatal);
+    engine.emit(stopped);
     let stopSettled = false;
     let clearSettled = false;
     let disposeSettled = false;
@@ -138,6 +143,8 @@ describe("SessionController terminal event ownership", () => {
     expect(microphoneStop).toHaveBeenCalledTimes(1);
     expect(engine.session.stop).not.toHaveBeenCalled();
     expect(engine.session.cancel).not.toHaveBeenCalled();
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(dispatch.mock.calls.slice(0, 2).map(([event]) => event)).toEqual([fatal, stopped]);
 
     resolveMicrophoneStop();
     await Promise.all([stopping, clearing, disposing]);
@@ -295,7 +302,7 @@ describe("SessionController terminal event ownership", () => {
 });
 
 describe("SessionController inspection cancellation", () => {
-  it("awaits an active session stop before resolving stop", async () => {
+  it.each(["stop", "clear", "dispose"] as const)("shares an active stop release with concurrent %s", async (concurrentOperation) => {
     const engine = new PendingInspectionEngine();
     engine.inspect.mockResolvedValue({ available: true });
     let resolveStop: () => void = () => undefined;
@@ -303,21 +310,42 @@ describe("SessionController inspection cancellation", () => {
       () => new Promise<undefined>((resolve) => { resolveStop = () => resolve(undefined); }),
     );
     const microphoneStop = vi.fn(async () => undefined);
+    let signal: AbortSignal | undefined;
     const controller = new SessionController({
       dispatch: vi.fn(),
       engineFactory: () => engine,
-      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+      microphoneFactory: vi.fn(async (options) => {
+        signal = options.signal;
+        return { stop: microphoneStop };
+      }),
     });
     await controller.start(["en-US"]);
+    const owned = (controller as unknown as { active?: { queuedFrames: unknown[] } }).active;
+    owned?.queuedFrames.push({ frame: "queued" });
 
-    let settled = false;
-    const stopping = controller.stop().then(() => { settled = true; });
+    let firstSettled = false;
+    let secondSettled = false;
+    const stopping = controller.stop().then(() => { firstSettled = true; });
     await vi.waitFor(() => expect(engine.session.stop).toHaveBeenCalledTimes(1));
-    expect(settled).toBe(false);
+    const concurrent = (
+      concurrentOperation === "stop" ? controller.stop()
+        : concurrentOperation === "clear" ? controller.clear()
+          : controller.dispose()
+    ).then(() => { secondSettled = true; });
+    await Promise.resolve();
+
+    expect(firstSettled).toBe(false);
+    expect(secondSettled).toBe(false);
+    expect(engine.session.stop).toHaveBeenCalledTimes(1);
+    expect(engine.session.cancel).not.toHaveBeenCalled();
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(signal?.aborted).toBe(true);
+    expect(owned?.queuedFrames).toEqual([]);
+    expect(engine.unsubscribes[0]).not.toHaveBeenCalled();
 
     resolveStop();
-    await stopping;
-    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    await Promise.all([stopping, concurrent]);
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
   });
 
   it("awaits active-session cancellation before resolving clear", async () => {
@@ -327,20 +355,96 @@ describe("SessionController inspection cancellation", () => {
     (engine.session.cancel as ReturnType<typeof vi.fn>).mockImplementation(
       () => new Promise<undefined>((resolve) => { resolveCancel = () => resolve(undefined); }),
     );
+    const microphoneStop = vi.fn(async () => undefined);
+    let signal: AbortSignal | undefined;
     const controller = new SessionController({
       dispatch: vi.fn(),
       engineFactory: () => engine,
-      microphoneFactory: vi.fn(async () => ({ stop: vi.fn(async () => undefined) })),
+      microphoneFactory: vi.fn(async (options) => {
+        signal = options.signal;
+        return { stop: microphoneStop };
+      }),
     });
     await controller.start(["en-US"]);
+    const owned = (controller as unknown as { active?: { queuedFrames: unknown[] } }).active;
+    owned?.queuedFrames.push({ frame: "queued" });
 
     let settled = false;
     const clearing = controller.clear().then(() => { settled = true; });
     await vi.waitFor(() => expect(engine.session.cancel).toHaveBeenCalledTimes(1));
     expect(settled).toBe(false);
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(signal?.aborted).toBe(true);
+    expect(owned?.queuedFrames).toEqual([]);
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
 
     resolveCancel();
     await clearing;
+  });
+
+  it("keeps stop events subscribed until the engine stop settles", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    const dispatch = vi.fn();
+    const microphoneStop = vi.fn(async () => undefined);
+    const controller = new SessionController({
+      dispatch,
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+    });
+    const sessionId = await controller.start(["en-US"]);
+    dispatch.mockClear();
+    (engine.session.stop as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      engine.emit({ type: "state", sessionId, sequence: 1, state: "draining" });
+      engine.emit({ type: "state", sessionId, sequence: 2, state: "stopped" });
+    });
+
+    await controller.stop();
+
+    expect(dispatch.mock.calls.map(([event]) => event)).toEqual([
+      { type: "state", sessionId, sequence: 1, state: "draining" },
+      { type: "state", sessionId, sequence: 2, state: "stopped" },
+    ]);
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves microphone cleanup failure precedence over an engine stop failure", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    (engine.session.stop as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("engine stop failed"));
+    const microphoneStop = vi.fn(async () => { throw new Error("microphone stop failed"); });
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+    });
+    await controller.start(["en-US"]);
+
+    await expect(controller.stop()).rejects.toThrow("microphone stop failed");
+    expect(engine.session.stop).toHaveBeenCalledTimes(1);
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves final detach failure precedence while settling cancel and microphone failures", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    (engine.session.cancel as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("engine cancel failed"));
+    const unsubscribe = vi.fn(() => { throw new Error("unsubscribe failed"); });
+    engine.session.subscribe = vi.fn(() => unsubscribe);
+    const microphoneStop = vi.fn(async () => { throw new Error("microphone stop failed"); });
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+    });
+    await controller.start(["en-US"]);
+
+    await expect(controller.clear()).rejects.toThrow("unsubscribe failed");
+    expect(engine.session.cancel).toHaveBeenCalledTimes(1);
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
   it("retires progress reporting when a start becomes active", async () => {

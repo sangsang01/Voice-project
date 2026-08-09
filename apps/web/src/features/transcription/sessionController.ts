@@ -28,12 +28,12 @@ interface ActiveSession {
   unsubscribe?: () => void;
   readonly queuedFrames: PcmFrame[];
   release?: Promise<void>;
-  acceptsStoppedFollowup?: boolean;
+  retiringEvents?: "fatal-followup" | "stop";
   releaseFailureReported?: boolean;
   lateMicrophoneStop?: Promise<void>;
 }
 
-type ReleaseMode = "cancel" | "already-terminal";
+type ReleaseMode = "stop" | "cancel" | "already-terminal";
 
 interface StartAttempt {
   readonly sessionId: string;
@@ -87,16 +87,12 @@ export class SessionController {
   public async stop(): Promise<void> {
     this.cancelCurrentAttempt();
     const active = this.active;
+    if (this.active === active) this.active = undefined;
     if (!active) {
       await this.releasing;
       return;
     }
-    try {
-      await active.session.stop();
-    } finally {
-      if (this.active === active) this.active = undefined;
-      await this.release(active, "already-terminal");
-    }
+    await this.release(active, "stop");
   }
 
   public async clearAndRestart(candidateLanguages: readonly string[]): Promise<string> {
@@ -343,7 +339,7 @@ export class SessionController {
         this.currentAttempt = undefined;
         active.attempt.cancel();
       }
-      active.acceptsStoppedFollowup = event.type === "error";
+      active.retiringEvents = event.type === "error" ? "fatal-followup" : undefined;
       this.observeTerminalRelease(active, this.release(active, "already-terminal"));
       return;
     }
@@ -351,14 +347,22 @@ export class SessionController {
     // Some engines synchronously deliver fatal-error then stopped callbacks from
     // one terminal notification. Keep only that stopped follow-up dispatchable
     // while this exact session owns the in-flight terminal release.
+    if (active.release === undefined || this.releasing !== active.release) return;
+
+    if (active.retiringEvents === "stop") {
+      this.dispatch(event);
+      if (event.type === "state" && event.state === "stopped") {
+        active.retiringEvents = undefined;
+      }
+      return;
+    }
+
     if (
-      active.acceptsStoppedFollowup
+      active.retiringEvents === "fatal-followup"
       && event.type === "state"
       && event.state === "stopped"
-      && active.release !== undefined
-      && this.releasing === active.release
     ) {
-      active.acceptsStoppedFollowup = false;
+      active.retiringEvents = undefined;
       this.dispatch(event);
     }
   }
@@ -396,6 +400,20 @@ export class SessionController {
     this.observeTerminalRelease(active, stopping);
   }
 
+  private startCleanup(operation: () => void | Promise<void>): Promise<void> {
+    try {
+      return Promise.resolve(operation());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  private detach(active: ActiveSession): void {
+    const unsubscribe = active.unsubscribe;
+    active.unsubscribe = undefined;
+    unsubscribe?.();
+  }
+
   private pushFrame(active: ActiveSession, frame: PcmFrame): void {
     if (this.active !== active) return;
     active.queuedFrames.push(frame);
@@ -427,47 +445,64 @@ export class SessionController {
     return disposal;
   }
 
-  // Teardown is shared by concurrent stop/clear/dispose calls. The first caller's
-  // cancellation mode wins, and every caller awaits the same cleanup promise.
+  // Publish ownership before invoking engine or capture callbacks: either can
+  // synchronously replay terminal events or trigger a concurrent controller call.
+  // The first release mode wins and all later callers await this exact promise.
   private release(active: ActiveSession, mode: ReleaseMode): Promise<void> {
     if (!active.release) {
-      const releasing = (async () => {
-        let failed = false;
-        let failure: unknown;
-        const recordFailure = (error: unknown) => {
-          if (!failed) {
-            failed = true;
-            failure = error;
-          }
-        };
-
-        try {
-          active.abortController.abort();
-          if (mode === "cancel") await active.session.cancel();
-        } catch (error) {
-          recordFailure(error);
-        }
-        try {
-          await active.microphone?.stop();
-        } catch (error) {
-          recordFailure(error);
-        }
-        try {
-          active.unsubscribe?.();
-        } catch (error) {
-          recordFailure(error);
-        } finally {
-          active.queuedFrames.length = 0;
-        }
-
-        if (failed) throw failure;
-      })();
-      active.release = releasing.finally(() => {
-        active.acceptsStoppedFollowup = false;
+      let resolveRelease: () => void = () => undefined;
+      let rejectRelease: (error: unknown) => void = () => undefined;
+      const completion = new Promise<void>((resolve, reject) => {
+        resolveRelease = resolve;
+        rejectRelease = reject;
+      });
+      active.release = completion.finally(() => {
+        active.retiringEvents = undefined;
         if (this.active === active) this.active = undefined;
         if (this.releasing === active.release) this.releasing = undefined;
       });
       this.releasing = active.release;
+
+      if (mode === "stop") active.retiringEvents = "stop";
+      active.queuedFrames.length = 0;
+      const aborting = this.startCleanup(() => active.abortController.abort());
+      const sessionOperation = mode === "stop"
+        ? this.startCleanup(() => active.session.stop())
+        : mode === "cancel"
+          ? this.startCleanup(() => active.session.cancel())
+          : Promise.resolve();
+      const stoppingMicrophone = this.startCleanup(async () => {
+        await active.microphone?.stop();
+      });
+
+      let detaching: Promise<void>;
+      if (mode === "cancel") {
+        detaching = this.startCleanup(() => this.detach(active));
+      } else if (mode === "already-terminal") {
+        // Let a synchronous fatal -> stopped callback pair finish, then detach
+        // independently of a slow or hung microphone stop.
+        detaching = Promise.resolve().then(() => this.detach(active));
+      } else {
+        detaching = Promise.resolve();
+      }
+
+      if (mode === "stop") {
+        detaching = sessionOperation.then(
+          () => this.detach(active),
+          () => this.detach(active),
+        );
+      }
+
+      // Match the established nested-finally precedence: every later cleanup
+      // failure overrides an earlier one, while all operations still settle.
+      void Promise.allSettled([aborting, sessionOperation, stoppingMicrophone, detaching]).then((results) => {
+        let failure: PromiseRejectedResult | undefined;
+        for (const result of results) {
+          if (result.status === "rejected") failure = result;
+        }
+        if (failure?.status === "rejected") rejectRelease(failure.reason);
+        else resolveRelease();
+      });
     }
     return active.release;
   }
