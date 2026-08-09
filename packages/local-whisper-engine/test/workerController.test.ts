@@ -48,6 +48,36 @@ function collect() {
 const engineEvents = (events: WorkerEvent[]): EngineEvent[] =>
   events.flatMap((event) => (event.type === "event" ? [event.event] : []));
 
+function performanceRuntime(elapsedMs: readonly number[], clock: { value: number }) {
+  let windowsSeen = 0;
+  let transcriptions = 0;
+  const { runtime } = fakeRuntime({
+    vadProbs: (samples: Float32Array) => {
+      const probs = new Float32Array(Math.floor(samples.length / 512));
+      for (let index = 0; index < probs.length; index += 1) {
+        // 8 speech windows satisfy minSpeechMs; 16 silence windows flush the utterance.
+        probs[index] = windowsSeen++ % 24 < 8 ? 0.9 : 0.1;
+      }
+      return probs;
+    },
+    transcribe: async () => {
+      clock.value += elapsedMs[transcriptions++] ?? 0;
+      return { text: "utterance", language: "en", languageProbability: 1 };
+    },
+  });
+  return runtime;
+}
+
+async function pushUtterances(
+  controller: ReturnType<typeof createWorkerController>,
+  utterances: number,
+) {
+  // Every 40 frames supplies 25 VAD windows, enough to flush one 24-window utterance.
+  for (let index = 0; index < utterances * 40; index += 1) {
+    await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+  }
+}
+
 describe("worker controller", () => {
   it("emits one final segment per detected utterance", async () => {
     const { post, events } = collect();
@@ -186,27 +216,48 @@ describe("worker controller", () => {
     expect(errors[0]).toMatchObject({ code: "INTERNAL", fatal: true });
   });
 
-  it("warns without transcribing when the pending-utterance backlog is full, and does not stop the session", async () => {
+  it("warns once for sustained slow transcription and still emits every segment", async () => {
     const { post, events } = collect();
-    const { runtime } = fakeRuntime();
-    const transcribe = vi.fn(runtime.transcribe);
-    // maxPendingUtterances: 0 is the smallest possible cap -- the backlog check runs
-    // before session.pending is ever incremented for the utterance about to start, so a
-    // cap of 0 always trips it, without needing genuinely concurrent transcriptions.
-    const controller = createWorkerController({ ...runtime, transcribe }, post, { maxPendingUtterances: 0 });
+    const clock = { value: 0 };
+    const controller = createWorkerController(performanceRuntime([1_000, 1_000, 1_000, 1_000], clock), post, {
+      now: () => clock.value,
+    });
 
     await controller.handle({ type: "prepare", requestId: 1 });
     await controller.handle({ type: "open", request });
-    for (let index = 0; index < 60; index += 1) {
-      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
-    }
+    await pushUtterances(controller, 4);
 
     const warnings = engineEvents(events).filter((event) => event.type === "warning");
-    expect(warnings.some((event) => event.type === "warning" && event.code === "DEGRADED_PERFORMANCE")).toBe(true);
-    expect(transcribe).not.toHaveBeenCalled();
-    expect(engineEvents(events).filter((event) => event.type === "segment.upsert")).toHaveLength(0);
-    const states = engineEvents(events).filter((event) => event.type === "state");
-    expect(states.some((event) => event.type === "state" && event.state === "stopped")).toBe(false);
+    expect(warnings.filter((event) => event.type === "warning" && event.code === "DEGRADED_PERFORMANCE")).toHaveLength(1);
+    expect(engineEvents(events).filter((event) => event.type === "segment.upsert")).toHaveLength(4);
+  });
+
+  it("does not warn when every transcription is faster than its audio", async () => {
+    const { post, events } = collect();
+    const clock = { value: 0 };
+    const controller = createWorkerController(performanceRuntime([0, 0, 0, 0], clock), post, {
+      now: () => clock.value,
+    });
+
+    await controller.handle({ type: "prepare", requestId: 1 });
+    await controller.handle({ type: "open", request });
+    await pushUtterances(controller, 4);
+
+    expect(engineEvents(events).filter((event) => event.type === "warning" && event.code === "DEGRADED_PERFORMANCE")).toHaveLength(0);
+  });
+
+  it("does not warn until three new consecutive slow transcriptions", async () => {
+    const { post, events } = collect();
+    const clock = { value: 0 };
+    const controller = createWorkerController(performanceRuntime([1_000, 1_000, 0, 1_000], clock), post, {
+      now: () => clock.value,
+    });
+
+    await controller.handle({ type: "prepare", requestId: 1 });
+    await controller.handle({ type: "open", request });
+    await pushUtterances(controller, 4);
+
+    expect(engineEvents(events).filter((event) => event.type === "warning" && event.code === "DEGRADED_PERFORMANCE")).toHaveLength(0);
   });
 
   it("times out a hung transcription as a fatal error, exactly once", async () => {

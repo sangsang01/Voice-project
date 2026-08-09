@@ -1,22 +1,17 @@
-export type LocalDevice = "webgpu" | "wasm" | "unavailable";
-export interface StorageEstimate {
-    quota?: number;
-    usage?: number;
-}
-export interface BrowserStorage {
-    estimate(): Promise<StorageEstimate>;
-}
 export interface LocalCapabilityEnvironment {
-    gpu?: unknown;
+    crossOriginIsolated?: boolean;
     wasm?: unknown;
-    storage?: BrowserStorage;
+    simd?: boolean;
 }
 export interface LocalCapabilities {
-    device: LocalDevice;
-    storage: {
-        quota?: number;
-        usage?: number;
-        available?: number;
-    };
+    supported: boolean;
+    reason?: string;
 }
-export declare function inspectLocalCapabilities(environment?: LocalCapabilityEnvironment): Promise<LocalCapabilities>;
+export declare const SIMD_PROBE: Uint8Array<ArrayBuffer>;
+/**
+ * whisper.cpp's WASM build needs SIMD and pthreads. pthreads needs
+ * SharedArrayBuffer, which the browser only grants to cross-origin-isolated
+ * documents -- so a host that forgets COOP/COEP silently loses threading.
+ * Reporting it here turns that into a legible message instead of a mystery.
+ */
+export declare function inspectLocalCapabilities(environment?: LocalCapabilityEnvironment): LocalCapabilities;

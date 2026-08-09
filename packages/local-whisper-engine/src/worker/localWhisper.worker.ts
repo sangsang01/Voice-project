@@ -10,9 +10,10 @@ export type { WhisperRuntime } from "./bridgeRuntime.js";
 interface WorkerControllerOptions {
   /** ~60s of audio at 20ms per frame. */
   maxBufferedFrames?: number;
-  maxPendingUtterances?: number;
   vad?: Partial<VadGateConfig>;
   transcribeTimeoutMs?: number;
+  /** Injectable monotonic clock for deterministic controller tests. */
+  now?: () => number;
 }
 
 interface ActiveSession {
@@ -25,7 +26,7 @@ interface ActiveSession {
   audio: Float32Array[];
   audioStartMs: number;
   bufferedFrames: number;
-  pending: number;
+  consecutiveSlowTranscriptions: number;
   gate: ReturnType<typeof createVadGate>;
   vadCarry: Float32Array;
   windowIndex: number;
@@ -53,8 +54,8 @@ export function createWorkerController(
   options: WorkerControllerOptions = {},
 ) {
   const maxBufferedFrames = options.maxBufferedFrames ?? 3000;
-  const maxPendingUtterances = options.maxPendingUtterances ?? 3;
   const transcribeTimeoutMs = options.transcribeTimeoutMs ?? 30_000;
+  const now = options.now ?? (() => performance.now());
   let loadAbort = new AbortController();
   let active: ActiveSession | undefined;
   let commandQueue = Promise.resolve();
@@ -134,10 +135,23 @@ export function createWorkerController(
     const samples = sliceAudio(session, startMs, endMs);
     if (samples.length === 0 || session.terminal) return;
 
-    session.pending += 1;
+    const startedAt = now();
     try {
       const result = await runTranscribe(session, samples);
       if (session.terminal || session.abort.signal.aborted) return;
+
+      const elapsedMs = now() - startedAt;
+      const audioDurationMs = endMs - startMs;
+      session.consecutiveSlowTranscriptions = elapsedMs > audioDurationMs
+        ? session.consecutiveSlowTranscriptions + 1
+        : 0;
+      if (session.consecutiveSlowTranscriptions === 3) {
+        emit(session, {
+          type: "warning",
+          code: "DEGRADED_PERFORMANCE",
+          message: "Local transcription is slower than realtime.",
+        });
+      }
 
       const text = result.text.trim();
       if (text.length > 0) {
@@ -166,8 +180,6 @@ export function createWorkerController(
       });
       emitState(session, "stopped");
       return;
-    } finally {
-      session.pending -= 1;
     }
     trimAudio(session, endMs);
   };
@@ -192,10 +204,6 @@ export function createWorkerController(
       const windowStartMs = (session.windowIndex++ * VAD_WINDOW_SAMPLES * 1000) / SAMPLE_RATE;
       const decision = session.gate.push(probs[index]!, windowStartMs);
       if (decision.type === "flush") {
-        if (session.pending >= maxPendingUtterances) {
-          emit(session, { type: "warning", code: "DEGRADED_PERFORMANCE", message: "Local transcription is falling behind." });
-          continue;
-        }
         await transcribeUtterance(session, decision.startMs, decision.endMs);
       }
     }
@@ -228,7 +236,7 @@ export function createWorkerController(
           audio: [],
           audioStartMs: 0,
           bufferedFrames: 0,
-          pending: 0,
+          consecutiveSlowTranscriptions: 0,
           gate: createVadGate({ ...VAD_DEFAULTS, ...options.vad }),
           vadCarry: new Float32Array(0),
           windowIndex: 0,

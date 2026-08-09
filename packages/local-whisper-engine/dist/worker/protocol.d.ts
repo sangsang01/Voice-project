@@ -1,9 +1,7 @@
 import type { EngineEvent, PcmFrame, SessionRequest } from "@voice/transcription-contracts";
-export type InferenceDevice = "webgpu" | "wasm";
 export type MainToWorker = {
     type: "prepare";
     requestId: number;
-    device: InferenceDevice;
 } | {
     type: "open";
     request: SessionRequest;
@@ -27,11 +25,9 @@ export type WorkerEvent = {
 } | {
     type: "prepared";
     requestId: number;
-    device: InferenceDevice;
 } | {
     type: "prepare.error";
     requestId: number;
-    device: InferenceDevice;
     message: string;
 } | {
     type: "credit";
