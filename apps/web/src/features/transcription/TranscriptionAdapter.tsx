@@ -62,9 +62,9 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
         <aside className="console-controls">
           <header className="console-title"><p>Voice console</p><h1>Earth Assistant</h1></header>
           <div aria-label="Candidate languages">{LANGUAGES.map(([tag, label]) => <button aria-pressed={candidateLanguages.includes(tag)} className="control-button" key={tag} onClick={() => toggleLanguage(tag)} type="button">{label}</button>)}</div>
-          <button className="control-button" disabled={!controller || listening} onClick={() => controller && void run(() => controller.start(candidateLanguages))} type="button">Start</button>
-          <button className="control-button" disabled={!controller || !listening} onClick={() => { setStarting(false); setLoadProgress(undefined); if (controller) void controller.stop(); }} type="button">Stop</button>
-          <button className="control-button" disabled={!controller} onClick={() => controller && void run(() => controller.clearAndRestart(candidateLanguages))} type="button">Clear &amp; Restart</button>
+          <button className="control-button" disabled={listening} onClick={() => void run(() => controller.start(candidateLanguages))} type="button">Start</button>
+          <button className="control-button" disabled={!listening} onClick={() => { setStarting(false); setLoadProgress(undefined); void controller.stop(); }} type="button">Stop</button>
+          <button className="control-button" onClick={() => void run(() => controller.clearAndRestart(candidateLanguages))} type="button">Clear &amp; Restart</button>
           <div className="console-meta"><p aria-atomic="true" aria-live="polite" className="status" role="status"><span className={`status-dot${listening ? " status-dot--listening" : ""}`} aria-hidden="true" />{listening ? "Listening" : "Standby"}</p><p className="engine-mode">Local transcription (on this device)</p><p className="clock">Local {formatClock(now, false)} · UTC {formatClock(now, true)}</p></div>
         </aside>
         <section className="console-output" aria-label="Voice transcript">

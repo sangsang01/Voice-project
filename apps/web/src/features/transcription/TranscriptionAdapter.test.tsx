@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type {
   EngineEvent,
   EngineEventListener,
+  EngineInspection,
   PcmFrame,
   SessionRequest,
   TranscriptionEngine,
@@ -52,7 +53,7 @@ class ControlledEngine implements TranscriptionEngine {
     return this.session;
   });
   public readonly dispose = vi.fn(async () => undefined);
-  public readonly inspect = vi.fn(async () => ({ available: true }));
+  public readonly inspect = vi.fn<() => Promise<EngineInspection>>(async () => ({ available: true }));
 }
 
 function frame(sequence: number): PcmFrame {
@@ -126,8 +127,41 @@ describe("TranscriptionAdapter", () => {
     await waitFor(() => expect(engine.open).toHaveBeenCalledTimes(2));
 
     expect(factory).toHaveBeenCalledTimes(1);
+    expect(engine.inspect).toHaveBeenCalledTimes(2);
     expect(engine.prepare).toHaveBeenCalledTimes(2);
     expect(engine.dispose).not.toHaveBeenCalled();
+  });
+
+  it("shows model preparation while a local model load remains pending", async () => {
+    const engine = new ControlledEngine();
+    engine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
+    renderAdapter({ engine });
+
+    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+
+    expect(await screen.findByText("Preparing local model…")).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("Listening");
+  });
+
+  it("surfaces unsupported local capabilities without preparing or opening an engine", async () => {
+    const engine = new ControlledEngine();
+    engine.inspect.mockResolvedValue({
+      available: false,
+      reason: "Local transcription needs cross-origin isolation. Serve this page with the COOP and COEP headers.",
+    });
+    engine.prepare.mockImplementation(async () => { throw new Error("prepare must not run"); });
+    engine.open.mockImplementation(async () => { throw new Error("open must not run"); });
+    renderAdapter({ engine });
+
+    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("cross-origin isolation");
+    expect(screen.getByRole("status")).toHaveTextContent("Standby");
+    expect(engine.inspect).toHaveBeenCalledTimes(1);
+    expect(engine.prepare).not.toHaveBeenCalled();
+    expect(engine.open).not.toHaveBeenCalled();
   });
 
   it("stopping while the model is still preparing cancels the pending start instead of going live", async () => {
@@ -202,5 +236,19 @@ describe("TranscriptionAdapter", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Microphone permission was denied");
     expect(screen.getByRole("status")).toHaveTextContent("Standby");
+  });
+
+  it("constructs one engine and disposes it once when unmounted", async () => {
+    const engine = new ControlledEngine();
+    const factory = vi.fn(() => engine);
+    const microphone = vi.fn(async () => ({ stop: vi.fn(async () => undefined) }));
+    const view = render(<TranscriptionAdapter engineFactory={factory} microphoneFactory={microphone} initialLanguages={["en-US"]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(engine.open).toHaveBeenCalledTimes(1));
+    expect(factory).toHaveBeenCalledTimes(1);
+
+    view.unmount();
+    await waitFor(() => expect(engine.dispose).toHaveBeenCalledTimes(1));
   });
 });

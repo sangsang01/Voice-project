@@ -104,6 +104,8 @@ export class SessionController {
     const abortController = new AbortController();
     let active: ActiveSession | undefined;
     try {
+      const inspection = await engine.inspect();
+      if (!inspection.available) throw new Error(inspection.reason ?? "Local transcription is unavailable");
       await engine.prepare(request);
       if (token !== this.startToken) {
         // stop()/clear() ran while the model was still loading; don't open a session or
