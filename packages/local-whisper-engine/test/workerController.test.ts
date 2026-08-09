@@ -542,7 +542,13 @@ describe("worker controller", () => {
 
   it("brackets successful synchronous inference with lifecycle messages", async () => {
     const { post, events } = collect();
-    const { runtime } = fakeRuntime();
+    let transcribedSampleCount = 0;
+    const { runtime } = fakeRuntime({
+      transcribe: async (samples) => {
+        transcribedSampleCount = samples.length;
+        return { text: "hello world", language: "en", languageProbability: 1 };
+      },
+    });
     const controller = createWorkerController(runtime, post);
 
     await controller.handle({ type: "prepare", requestId: 1 });
@@ -552,7 +558,7 @@ describe("worker controller", () => {
     }
 
     expect(events.filter((event) => event.type.startsWith("inference."))).toEqual([
-      { type: "inference.started", sessionId: SESSION, token: 1 },
+      { type: "inference.started", sessionId: SESSION, token: 1, audioDurationMs: transcribedSampleCount / 16 },
       { type: "inference.finished", sessionId: SESSION, token: 1 },
     ]);
   });
@@ -572,7 +578,7 @@ describe("worker controller", () => {
 
     const lifecycle = events.filter((event) => event.type.startsWith("inference."));
     expect(lifecycle).toEqual([
-      { type: "inference.started", sessionId: SESSION, token: 1 },
+      { type: "inference.started", sessionId: SESSION, token: 1, audioDurationMs: expect.any(Number) },
       { type: "inference.finished", sessionId: SESSION, token: 1 },
     ]);
     expect(events.indexOf(lifecycle[1]!)).toBeLessThan(events.findIndex(

@@ -33,6 +33,7 @@ export type WorkerEvent = {
     type: "inference.started";
     sessionId: string;
     token: number;
+    audioDurationMs: number;
 } | {
     type: "inference.finished";
     sessionId: string;

@@ -7,6 +7,7 @@ export interface WorkerLike {
     terminate(): void;
 }
 export interface LocalWhisperEngineOptions {
+    /** Exact fixed watchdog override; production derives a budget from inference audio duration. */
     inferenceTimeoutMs?: number;
     maxBufferedFrames?: number;
     onProgress?: (progress: number) => void;

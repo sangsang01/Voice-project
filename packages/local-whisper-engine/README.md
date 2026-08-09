@@ -64,11 +64,13 @@ Policy stays in TypeScript: buffering, VAD thresholds, utterance boundaries,
 candidate-language mapping, timeouts, backpressure, and event sequencing are
 unit-testable without compiling WASM.
 
-The 30-second inference watchdog runs in `LocalWhisperEngine` on the main-window
-event loop. The worker reports inference start and finish around the synchronous
-Embind call; if `whisper_full` blocks, the main window can still terminate that
-worker and emit a fatal `TIMEOUT`. A timer inside the inference worker cannot
-provide that guarantee because the synchronous WASM call blocks its event loop.
+The inference watchdog runs in `LocalWhisperEngine` on the main-window event
+loop. Production budgets twenty times the actual inference audio duration, with
+a 60-second floor and a finite ten-minute ceiling; tests can inject an exact
+fixed override. The worker reports inference start and finish around the
+synchronous Embind call, so the main window can terminate a blocked worker and
+emit a fatal `TIMEOUT`. A timer inside the inference worker cannot provide that
+guarantee because the synchronous WASM call blocks its event loop.
 
 The Emscripten output supports pthreads, but the browser runtime currently calls
 both bridge initialization and inference with one thread. Real Chromium e2e

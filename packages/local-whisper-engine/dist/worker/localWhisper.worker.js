@@ -118,7 +118,12 @@ export function createWorkerController(runtime, post, options = {}) {
             return;
         const startedAt = now();
         const token = ++inferenceToken;
-        post({ type: "inference.started", sessionId: session.request.sessionId, token });
+        post({
+            type: "inference.started",
+            sessionId: session.request.sessionId,
+            token,
+            audioDurationMs: (samples.length * 1000) / SAMPLE_RATE,
+        });
         try {
             let result;
             try {

@@ -433,8 +433,10 @@ describe("LocalWhisperEngine", () => {
     const events: unknown[] = [];
     session.subscribe((event) => events.push(event));
 
-    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
-    await vi.advanceTimersByTimeAsync(50);
+    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1, audioDurationMs: 25_000 });
+    await vi.advanceTimersByTimeAsync(49);
+    expect(workers[0]!.terminateCalls).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
 
     expect(workers[0]!.terminateCalls).toBe(1);
     expect(vi.getTimerCount()).toBe(0);
@@ -452,6 +454,30 @@ describe("LocalWhisperEngine", () => {
     await expect(engine.open({ ...request, sessionId: "recovered" })).resolves.toBeDefined();
   });
 
+  it("budgets the production watchdog from actual inference audio duration", async () => {
+    vi.useFakeTimers();
+    const worker = new FakeWorker();
+    const engine = new LocalWhisperEngine({ workerFactory: () => worker });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    worker.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const events: unknown[] = [];
+    session.subscribe((event) => events.push(event));
+
+    worker.emit({ type: "inference.started", sessionId: request.sessionId, token: 1, audioDurationMs: 3_500 });
+    await vi.advanceTimersByTimeAsync(69_999);
+    expect(worker.terminateCalls).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(worker.terminateCalls).toBe(1);
+    expect(events.slice(-2)).toEqual([
+      expect.objectContaining({ type: "error", code: "TIMEOUT", fatal: true }),
+      expect.objectContaining({ type: "state", state: "stopped" }),
+    ]);
+  });
+
   it("clears the inference watchdog when the worker reports completion", async () => {
     vi.useFakeTimers();
     const worker = new FakeWorker();
@@ -462,7 +488,7 @@ describe("LocalWhisperEngine", () => {
     await preparing;
     await engine.open(request);
 
-    worker.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    worker.emit({ type: "inference.started", sessionId: request.sessionId, token: 1, audioDurationMs: 1_000 });
     expect(vi.getTimerCount()).toBe(1);
     worker.emit({ type: "inference.finished", sessionId: request.sessionId, token: 1 });
     expect(vi.getTimerCount()).toBe(0);
@@ -482,7 +508,7 @@ describe("LocalWhisperEngine", () => {
     const session = await engine.open(request);
     const events: unknown[] = [];
     session.subscribe((event) => events.push(event));
-    worker.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    worker.emit({ type: "inference.started", sessionId: request.sessionId, token: 1, audioDurationMs: 1_000 });
     expect(vi.getTimerCount()).toBe(1);
 
     await engine.dispose();
@@ -508,7 +534,7 @@ describe("LocalWhisperEngine", () => {
     await preparing;
     await engine.open(request);
     const oldMessageHandler = workers[0]!.onmessage;
-    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1, audioDurationMs: 1_000 });
     expect(vi.getTimerCount()).toBe(1);
     workers[0]!.crash();
     expect(vi.getTimerCount()).toBe(0);
@@ -517,7 +543,7 @@ describe("LocalWhisperEngine", () => {
     workers[1]!.emit({ type: "prepared", requestId: 2 });
     await recovering;
     oldMessageHandler?.({
-      data: { type: "inference.started", sessionId: request.sessionId, token: 2 },
+      data: { type: "inference.started", sessionId: request.sessionId, token: 2, audioDurationMs: 1_000 },
     } as MessageEvent<WorkerEvent>);
     expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(100);
@@ -552,7 +578,7 @@ describe("LocalWhisperEngine", () => {
     });
     const stopping = session.stop();
 
-    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1, audioDurationMs: 1_000 });
     await expect(vi.advanceTimersByTimeAsync(50)).resolves.toBeDefined();
     await expect(stopping).resolves.toBeUndefined();
 
@@ -640,7 +666,7 @@ describe("LocalWhisperEngine", () => {
     session.subscribe((event) => events.push(event));
     workers[0]!.terminateError = new Error("terminate was denied");
 
-    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1, audioDurationMs: 1_000 });
     await vi.advanceTimersByTimeAsync(50);
 
     expect(events.slice(-2)).toEqual([

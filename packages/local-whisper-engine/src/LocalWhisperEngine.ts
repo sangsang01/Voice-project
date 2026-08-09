@@ -11,6 +11,7 @@ import type {
 import { validatePcmFrame, validateSessionRequest } from "@voice/transcription-contracts";
 
 import { inspectLocalCapabilities } from "./browser/capabilities.js";
+import { inferenceWatchdogBudgetMs } from "./inferenceWatchdog.js";
 import type { MainToWorker, WorkerEvent } from "./worker/protocol.js";
 
 export interface WorkerLike {
@@ -21,6 +22,7 @@ export interface WorkerLike {
 }
 
 export interface LocalWhisperEngineOptions {
+  /** Exact fixed watchdog override; production derives a budget from inference audio duration. */
   inferenceTimeoutMs?: number;
   maxBufferedFrames?: number;
   onProgress?: (progress: number) => void;
@@ -319,7 +321,7 @@ export class LocalWhisperEngine implements TranscriptionEngine {
       return;
     }
     if (event.type === "inference.started") {
-      this.startInferenceWatchdog(worker, generation, event.sessionId, event.token);
+      this.startInferenceWatchdog(worker, generation, event.sessionId, event.token, event.audioDurationMs);
       return;
     }
     if (event.type === "inference.finished") {
@@ -341,13 +343,14 @@ export class LocalWhisperEngine implements TranscriptionEngine {
     generation: number,
     sessionId: string,
     token: number,
+    audioDurationMs: number,
   ): void {
     if (this.activeSession?.sessionId !== sessionId) return;
     this.clearInferenceWatchdog();
     let watchdog: InferenceWatchdog;
     const timer = setTimeout(
       () => this.handleInferenceTimeout(watchdog),
-      this.options.inferenceTimeoutMs ?? 30_000,
+      this.options.inferenceTimeoutMs ?? inferenceWatchdogBudgetMs(audioDurationMs),
     );
     watchdog = {
       generation,

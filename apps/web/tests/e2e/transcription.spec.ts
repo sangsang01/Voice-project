@@ -326,10 +326,19 @@ test("transcribes the JFK fixture through the real browser worker, VAD, and whis
       await bridge.pushFixture(base64);
     }, fixture.toString("base64"));
 
+    let fatalAlertText: string | undefined;
     await expect.poll(async () => {
+      const alert = page.getByRole("alert");
+      if (await alert.isVisible()) {
+        fatalAlertText = await alert.innerText();
+        return "terminal";
+      }
       const text = await page.locator(".transcript").innerText();
-      return text.toLowerCase().replace(/[^a-z]+/g, " ");
-    }, { timeout: 100_000 }).toContain("my fellow americans");
+      return text.toLowerCase().replace(/[^a-z]+/g, " ").includes("my fellow americans")
+        ? "terminal"
+        : "pending";
+    }, { timeout: 100_000 }).toBe("terminal");
+    if (fatalAlertText) throw new Error(`Real local transcription failed: ${fatalAlertText}`);
 
     await page.getByRole("button", { name: "Stop" }).click();
     await expect(page.getByRole("status")).toContainText("Standby", { timeout: 20_000 });
