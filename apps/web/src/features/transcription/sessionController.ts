@@ -20,6 +20,7 @@ export interface SessionControllerOptions {
 
 interface ActiveSession {
   readonly id: string;
+  readonly attempt: StartAttempt;
   readonly engine: TranscriptionEngine;
   readonly session: TranscriptionSession;
   readonly abortController: AbortController;
@@ -27,7 +28,12 @@ interface ActiveSession {
   unsubscribe?: () => void;
   readonly queuedFrames: PcmFrame[];
   release?: Promise<void>;
+  acceptsStoppedFollowup?: boolean;
+  releaseFailureReported?: boolean;
+  lateMicrophoneStop?: Promise<void>;
 }
+
+type ReleaseMode = "cancel" | "already-terminal";
 
 interface StartAttempt {
   readonly sessionId: string;
@@ -61,7 +67,7 @@ export class SessionController {
   private releasing: Promise<void> | undefined;
   private readonly engineDisposals = new Set<Promise<void>>();
   private readonly engineDisposalFailures: unknown[] = [];
-  private cachedEngineDisposal: Promise<void> | undefined;
+  private readonly cachedEngineDisposals = new WeakMap<TranscriptionEngine, Promise<void>>();
   private disposal: Promise<void> | undefined;
   private disposed = false;
 
@@ -89,7 +95,7 @@ export class SessionController {
       await active.session.stop();
     } finally {
       if (this.active === active) this.active = undefined;
-      await this.release(active, false);
+      await this.release(active, "already-terminal");
     }
   }
 
@@ -191,20 +197,28 @@ export class SessionController {
       // assignment is guarded by isCurrent above, so a stale attempt cannot publish.
       this.engine = engine;
       attempt.publishedEngine = true;
-      active = { id: attempt.sessionId, engine, session, abortController, queuedFrames: [] };
+      active = { id: attempt.sessionId, attempt, engine, session, abortController, queuedFrames: [] };
       this.active = active;
       active.unsubscribe = session.subscribe((event) => this.handleEvent(active!, event));
+      if (!this.isCurrent(attempt) || this.active !== active) return attempt.sessionId;
 
       const startingMicrophone = Promise.resolve(this.microphoneFactory({
         signal: abortController.signal,
         onFrame: (frame) => this.pushFrame(active!, frame),
       }));
       void startingMicrophone.then(
-        (capture) => { if (!this.isCurrent(attempt)) void capture.stop().catch(() => undefined); },
+        (capture) => {
+          if (!this.isCurrent(attempt) || this.active !== active) {
+            this.stopLateMicrophone(active!, capture);
+          }
+        },
         () => undefined,
       );
       const microphone = await this.awaitAttempt(attempt, startingMicrophone);
-      if (!this.isCurrent(attempt)) return attempt.sessionId;
+      if (!this.isCurrent(attempt) || this.active !== active) {
+        if (microphone) this.stopLateMicrophone(active, microphone);
+        return attempt.sessionId;
+      }
       active.microphone = microphone;
       this.finishAttempt(attempt);
       return attempt.sessionId;
@@ -214,7 +228,7 @@ export class SessionController {
       let failure = error;
       if (active && this.active === active) {
         this.active = undefined;
-        try { await this.release(active, true); }
+        try { await this.release(active, "cancel"); }
         catch (cleanupError) { failure = cleanupError; }
       } else if (engine && this.engine === engine) {
         // A previously cached engine that now fails inspection, preparation, or
@@ -318,7 +332,68 @@ export class SessionController {
   }
 
   private handleEvent(active: ActiveSession, event: EngineEvent): void {
-    if (this.active === active && event.sessionId === active.id) this.dispatch(event);
+    if (event.sessionId !== active.id) return;
+
+    if (this.active === active) {
+      this.dispatch(event);
+      if (!this.isTerminalEvent(event)) return;
+
+      this.active = undefined;
+      if (this.currentAttempt === active.attempt) {
+        this.currentAttempt = undefined;
+        active.attempt.cancel();
+      }
+      active.acceptsStoppedFollowup = event.type === "error";
+      this.observeTerminalRelease(active, this.release(active, "already-terminal"));
+      return;
+    }
+
+    // Some engines synchronously deliver fatal-error then stopped callbacks from
+    // one terminal notification. Keep only that stopped follow-up dispatchable
+    // while this exact session owns the in-flight terminal release.
+    if (
+      active.acceptsStoppedFollowup
+      && event.type === "state"
+      && event.state === "stopped"
+      && active.release !== undefined
+      && this.releasing === active.release
+    ) {
+      active.acceptsStoppedFollowup = false;
+      this.dispatch(event);
+    }
+  }
+
+  private isTerminalEvent(event: EngineEvent): boolean {
+    return (event.type === "error" && event.fatal)
+      || (event.type === "state" && event.state === "stopped");
+  }
+
+  private observeTerminalRelease(active: ActiveSession, release: Promise<void>): void {
+    void release.then(
+      () => undefined,
+      (error) => {
+        if (active.releaseFailureReported) return;
+        active.releaseFailureReported = true;
+        try {
+          this.onLocalError(error instanceof Error ? error.message : "Failed to release transcription capture");
+        } catch {
+          // A consumer callback must not turn an observed cleanup failure into an
+          // unhandled rejection from this synchronous event bridge.
+        }
+      },
+    );
+  }
+
+  private stopLateMicrophone(active: ActiveSession, microphone: MicrophoneCapture): void {
+    if (active.lateMicrophoneStop) return;
+    let stopping: Promise<void>;
+    try {
+      stopping = Promise.resolve(microphone.stop());
+    } catch (error) {
+      stopping = Promise.reject(error);
+    }
+    active.lateMicrophoneStop = stopping;
+    this.observeTerminalRelease(active, stopping);
   }
 
   private pushFrame(active: ActiveSession, frame: PcmFrame): void {
@@ -337,38 +412,59 @@ export class SessionController {
     const active = this.active;
     this.active = undefined;
     this.dispatch({ type: "clear", nextSessionId });
-    if (active) await this.release(active, true);
+    if (active) await this.release(active, "cancel");
     else await this.releasing;
   }
 
   private dropEngine(): Promise<void> {
-    if (this.cachedEngineDisposal) return this.cachedEngineDisposal;
     const engine = this.engine;
     if (!engine) return Promise.resolve();
     this.engine = undefined;
+    const pending = this.cachedEngineDisposals.get(engine);
+    if (pending) return pending;
     const disposal = this.startEngineDisposal(engine);
-    this.cachedEngineDisposal = disposal;
-    void disposal.then(
-      () => { if (this.cachedEngineDisposal === disposal) this.cachedEngineDisposal = undefined; },
-      () => { if (this.cachedEngineDisposal === disposal) this.cachedEngineDisposal = undefined; },
-    );
+    this.cachedEngineDisposals.set(engine, disposal);
     return disposal;
   }
 
   // Teardown is shared by concurrent stop/clear/dispose calls. The first caller's
   // cancellation mode wins, and every caller awaits the same cleanup promise.
-  private release(active: ActiveSession, cancel: boolean): Promise<void> {
+  private release(active: ActiveSession, mode: ReleaseMode): Promise<void> {
     if (!active.release) {
       const releasing = (async () => {
+        let failed = false;
+        let failure: unknown;
+        const recordFailure = (error: unknown) => {
+          if (!failed) {
+            failed = true;
+            failure = error;
+          }
+        };
+
         try {
           active.abortController.abort();
-          if (cancel) await active.session.cancel();
-        } finally {
-          try { await active.microphone?.stop(); }
-          finally { active.unsubscribe?.(); }
+          if (mode === "cancel") await active.session.cancel();
+        } catch (error) {
+          recordFailure(error);
         }
+        try {
+          await active.microphone?.stop();
+        } catch (error) {
+          recordFailure(error);
+        }
+        try {
+          active.unsubscribe?.();
+        } catch (error) {
+          recordFailure(error);
+        } finally {
+          active.queuedFrames.length = 0;
+        }
+
+        if (failed) throw failure;
       })();
       active.release = releasing.finally(() => {
+        active.acceptsStoppedFollowup = false;
+        if (this.active === active) this.active = undefined;
         if (this.releasing === active.release) this.releasing = undefined;
       });
       this.releasing = active.release;
