@@ -30,6 +30,14 @@ export type WorkerEvent = {
     requestId: number;
     message: string;
 } | {
+    type: "inference.started";
+    sessionId: string;
+    token: number;
+} | {
+    type: "inference.finished";
+    sessionId: string;
+    token: number;
+} | {
     type: "credit";
     sessionId: string;
     frames: number;

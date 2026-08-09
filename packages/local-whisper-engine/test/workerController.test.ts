@@ -291,30 +291,10 @@ describe("worker controller", () => {
     expect(engineEvents(events).filter((event) => event.type === "segment.upsert")).toHaveLength(7);
   });
 
-  it("times out a hung transcription as a fatal error, exactly once", async () => {
-    const { post, events } = collect();
-    const { runtime } = fakeRuntime({
-      transcribe: () => new Promise(() => { /* never resolves, simulating a hung whisper_full() call */ }),
-    });
-    const controller = createWorkerController(runtime, post, { transcribeTimeoutMs: 50 });
-
-    await controller.handle({ type: "prepare", requestId: 1 });
-    await controller.handle({ type: "open", request });
-    for (let index = 0; index < 60; index += 1) {
-      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
-    }
-
-    const errors = engineEvents(events).filter((event) => event.type === "error");
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toMatchObject({ code: "TIMEOUT", fatal: true });
-    const states = engineEvents(events).filter((event) => event.type === "state");
-    expect(states.at(-1)).toMatchObject({ state: "stopped" });
-  });
-
-  it("does not spuriously time out after a fast transcription already completed", async () => {
+  it("brackets successful synchronous inference with lifecycle messages", async () => {
     const { post, events } = collect();
     const { runtime } = fakeRuntime();
-    const controller = createWorkerController(runtime, post, { transcribeTimeoutMs: 50 });
+    const controller = createWorkerController(runtime, post);
 
     await controller.handle({ type: "prepare", requestId: 1 });
     await controller.handle({ type: "open", request });
@@ -322,11 +302,32 @@ describe("worker controller", () => {
       await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
     }
 
-    // Sit past the timeout window: a leaked timer would have its best chance to fire here.
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(events.filter((event) => event.type.startsWith("inference."))).toEqual([
+      { type: "inference.started", sessionId: SESSION, token: 1 },
+      { type: "inference.finished", sessionId: SESSION, token: 1 },
+    ]);
+  });
 
-    const segments = engineEvents(events).filter((event) => event.type === "segment.upsert");
-    expect(segments).toHaveLength(1);
-    expect(engineEvents(events).filter((event) => event.type === "error")).toHaveLength(0);
+  it("reports inference completion before a synchronous runtime failure", async () => {
+    const { post, events } = collect();
+    const { runtime } = fakeRuntime({
+      transcribe: () => { throw new Error("bridge exploded"); },
+    });
+    const controller = createWorkerController(runtime, post);
+
+    await controller.handle({ type: "prepare", requestId: 1 });
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 60; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    const lifecycle = events.filter((event) => event.type.startsWith("inference."));
+    expect(lifecycle).toEqual([
+      { type: "inference.started", sessionId: SESSION, token: 1 },
+      { type: "inference.finished", sessionId: SESSION, token: 1 },
+    ]);
+    expect(events.indexOf(lifecycle[1]!)).toBeLessThan(events.findIndex(
+      (event) => event.type === "event" && event.event.type === "error",
+    ));
   });
 });

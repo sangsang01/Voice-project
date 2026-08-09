@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LocalWhisperEngine, type WorkerLike } from "../src/LocalWhisperEngine.js";
 import { makePcmFrame, makeSessionRequest } from "@voice/transcription-contracts/testing";
@@ -9,6 +9,7 @@ class FakeWorker implements WorkerLike {
   public onerror: ((event: ErrorEvent) => void) | null = null;
   public readonly sent: unknown[] = [];
   public terminated = false;
+  public terminateCalls = 0;
 
   public postMessage(message: unknown): void {
     this.sent.push(message);
@@ -16,6 +17,7 @@ class FakeWorker implements WorkerLike {
 
   public terminate(): void {
     this.terminated = true;
+    this.terminateCalls += 1;
   }
 
   public emit(message: WorkerEvent): void {
@@ -32,6 +34,50 @@ function flush(): Promise<void> {
 }
 
 describe("LocalWhisperEngine", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("settles an in-flight preparation when disposed", async () => {
+    const worker = new FakeWorker();
+    const engine = new LocalWhisperEngine({ workerFactory: () => worker });
+    const preparing = engine.prepare(makeSessionRequest(["en-US"]));
+    const outcome = preparing.then(
+      () => "resolved",
+      (error: unknown) => error instanceof Error ? error.message : String(error),
+    );
+    const oldMessageHandler = worker.onmessage;
+
+    await engine.dispose();
+    oldMessageHandler?.({ data: { type: "prepared", requestId: 1 } } as MessageEvent<WorkerEvent>);
+    await flush();
+
+    expect(await Promise.race([outcome, Promise.resolve("pending")])).toBe("engine is disposed");
+    expect(worker.terminated).toBe(true);
+    expect(worker.terminateCalls).toBe(1);
+    expect(worker.onmessage).toBeNull();
+    expect(worker.onerror).toBeNull();
+  });
+
+  it("shares one worker and prepare request across concurrent preparations", async () => {
+    const workers: FakeWorker[] = [];
+    const engine = new LocalWhisperEngine({ workerFactory: () => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    } });
+    const request = makeSessionRequest(["en-US"]);
+
+    const first = engine.prepare(request);
+    const second = engine.prepare(request);
+
+    expect(workers).toHaveLength(1);
+    expect(workers[0]!.sent).toEqual([{ type: "prepare", requestId: 1 }]);
+    expect(workers[0]!.terminated).toBe(false);
+    workers[0]!.emit({ type: "prepared", requestId: 1 });
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+  });
+
   it("relays preparation progress through the single local backend", async () => {
     const worker = new FakeWorker();
     const progress: number[] = [];
@@ -249,5 +295,116 @@ describe("LocalWhisperEngine", () => {
 
     worker.emit({ type: "credit", sessionId: firstRequest.sessionId, frames: 1 });
     expect(second.push(makePcmFrame(2))).toEqual({ accepted: false, reason: "backpressure" });
+  });
+
+  it("terminates a blocked inference from the engine event loop and can prepare a replacement", async () => {
+    vi.useFakeTimers();
+    const workers: FakeWorker[] = [];
+    const engine = new LocalWhisperEngine({
+      inferenceTimeoutMs: 50,
+      workerFactory: () => {
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker;
+      },
+    });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    workers[0]!.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const events: unknown[] = [];
+    session.subscribe((event) => events.push(event));
+
+    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(workers[0]!.terminateCalls).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(events.slice(-2)).toEqual([
+      expect.objectContaining({ type: "error", code: "TIMEOUT", fatal: true }),
+      expect.objectContaining({ type: "state", state: "stopped" }),
+    ]);
+    expect(events.filter((event) => (event as { type?: string }).type === "error")).toHaveLength(1);
+    await expect(engine.open(request)).rejects.toThrow("prepared");
+
+    const recovering = engine.prepare(request);
+    expect(workers).toHaveLength(2);
+    workers[1]!.emit({ type: "prepared", requestId: 2 });
+    await recovering;
+    await expect(engine.open({ ...request, sessionId: "recovered" })).resolves.toBeDefined();
+  });
+
+  it("clears the inference watchdog when the worker reports completion", async () => {
+    vi.useFakeTimers();
+    const worker = new FakeWorker();
+    const engine = new LocalWhisperEngine({ inferenceTimeoutMs: 50, workerFactory: () => worker });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    worker.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    await engine.open(request);
+
+    worker.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    expect(vi.getTimerCount()).toBe(1);
+    worker.emit({ type: "inference.finished", sessionId: request.sessionId, token: 1 });
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(worker.terminated).toBe(false);
+  });
+
+  it("clears the inference watchdog on disposal", async () => {
+    vi.useFakeTimers();
+    const worker = new FakeWorker();
+    const engine = new LocalWhisperEngine({ inferenceTimeoutMs: 50, workerFactory: () => worker });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    worker.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+    const events: unknown[] = [];
+    session.subscribe((event) => events.push(event));
+    worker.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    expect(vi.getTimerCount()).toBe(1);
+
+    await engine.dispose();
+
+    expect(vi.getTimerCount()).toBe(0);
+    expect(events.filter((event) => (event as { code?: string }).code === "TIMEOUT")).toHaveLength(0);
+  });
+
+  it("does not let an old worker watchdog terminate a replacement worker", async () => {
+    vi.useFakeTimers();
+    const workers: FakeWorker[] = [];
+    const engine = new LocalWhisperEngine({
+      inferenceTimeoutMs: 50,
+      workerFactory: () => {
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker;
+      },
+    });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    workers[0]!.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    await engine.open(request);
+    const oldMessageHandler = workers[0]!.onmessage;
+    workers[0]!.emit({ type: "inference.started", sessionId: request.sessionId, token: 1 });
+    expect(vi.getTimerCount()).toBe(1);
+    workers[0]!.crash();
+    expect(vi.getTimerCount()).toBe(0);
+
+    const recovering = engine.prepare(request);
+    workers[1]!.emit({ type: "prepared", requestId: 2 });
+    await recovering;
+    oldMessageHandler?.({
+      data: { type: "inference.started", sessionId: request.sessionId, token: 2 },
+    } as MessageEvent<WorkerEvent>);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(workers[1]!.terminated).toBe(false);
   });
 });

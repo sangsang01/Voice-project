@@ -21,9 +21,26 @@ export interface WorkerLike {
 }
 
 export interface LocalWhisperEngineOptions {
+  inferenceTimeoutMs?: number;
   maxBufferedFrames?: number;
   onProgress?: (progress: number) => void;
   workerFactory?: () => WorkerLike;
+}
+
+interface PendingPrepare {
+  generation: number;
+  requestId: number;
+  worker: WorkerLike;
+  resolve(): void;
+  reject(error: Error): void;
+}
+
+interface InferenceWatchdog {
+  generation: number;
+  sessionId: string;
+  timer: ReturnType<typeof setTimeout>;
+  token: number;
+  worker: WorkerLike;
 }
 
 class LocalSession implements TranscriptionSession {
@@ -93,11 +110,11 @@ class LocalSession implements TranscriptionSession {
     if (!this.terminal) this.buffered = Math.max(0, this.buffered - frames);
   }
 
-  public fail(message: string): void {
+  public fail(code: "INTERNAL" | "TIMEOUT", message: string): void {
     if (this.terminal) return;
     this.closing = true;
     this.terminal = true;
-    this.emit({ type: "error", sessionId: this.request.sessionId, sequence: this.eventSequence + 1, code: "INTERNAL", fatal: true, message });
+    this.emit({ type: "error", sessionId: this.request.sessionId, sequence: this.eventSequence + 1, code, fatal: true, message });
     this.emit({ type: "state", sessionId: this.request.sessionId, sequence: this.eventSequence + 1, state: "stopped" });
     this.resolveStop?.();
   }
@@ -125,6 +142,10 @@ export class LocalWhisperEngine implements TranscriptionEngine {
   private prepared = false;
   private disposed = false;
   private requestId = 0;
+  private workerGeneration = 0;
+  private preparing: Promise<void> | undefined;
+  private pendingPrepare: PendingPrepare | undefined;
+  private inferenceWatchdog: InferenceWatchdog | undefined;
   private activeSession: LocalSession | undefined;
 
   public constructor(private readonly options: LocalWhisperEngineOptions = {}) {}
@@ -139,8 +160,15 @@ export class LocalWhisperEngine implements TranscriptionEngine {
     this.assertAvailable();
     validateSessionRequest(request);
     if (this.prepared) return;
-    await this.startWorker();
-    this.prepared = true;
+    if (this.preparing) return this.preparing;
+
+    const preparing = this.startWorker();
+    this.preparing = preparing;
+    try {
+      await preparing;
+    } finally {
+      if (this.preparing === preparing) this.preparing = undefined;
+    }
   }
 
   public async open(request: SessionRequest): Promise<TranscriptionSession> {
@@ -159,48 +187,206 @@ export class LocalWhisperEngine implements TranscriptionEngine {
   public async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
-    this.activeSession?.cancel();
-    this.worker?.postMessage({ type: "dispose" });
-    this.worker?.terminate();
+    this.prepared = false;
+    this.clearInferenceWatchdog();
+    try {
+      await this.activeSession?.cancel();
+    } catch {
+      // Worker teardown below is authoritative even if posting cancel failed.
+    }
+    this.activeSession = undefined;
+    const worker = this.worker;
+    if (worker) {
+      try {
+        worker.postMessage({ type: "dispose" });
+      } catch {
+        // A worker that is already failing still needs local teardown below.
+      }
+      worker.onmessage = null;
+      worker.onerror = null;
+      this.settlePrepare(worker, this.workerGeneration, new Error("engine is disposed"));
+      this.worker = undefined;
+      try {
+        worker.terminate();
+      } catch {
+        // The engine is still terminal and all local references are cleared.
+      }
+    } else if (this.pendingPrepare) {
+      this.settlePrepare(
+        this.pendingPrepare.worker,
+        this.pendingPrepare.generation,
+        new Error("engine is disposed"),
+      );
+    }
     this.worker = undefined;
+    this.preparing = undefined;
   }
 
-  private async startWorker(): Promise<void> {
-    this.worker?.terminate();
+  private startWorker(): Promise<void> {
+    if (this.worker) {
+      this.invalidateWorker(
+        this.worker,
+        this.workerGeneration,
+        new Error("local Whisper worker was replaced"),
+      );
+    }
     const worker = (this.options.workerFactory ?? defaultWorkerFactory)();
+    const generation = ++this.workerGeneration;
     this.worker = worker;
     const requestId = ++this.requestId;
-    await new Promise<void>((resolve, reject) => {
-      worker.onmessage = (message) => {
-        const event = message.data;
-        if (event.type === "progress" && event.requestId === requestId) this.options.onProgress?.(event.progress);
-        if (event.type === "prepared" && event.requestId === requestId) {
-          resolve();
-        }
-        if (event.type === "prepare.error" && event.requestId === requestId) reject(new Error(event.message));
-        if (event.type === "credit" && this.activeSession?.sessionId === event.sessionId) {
-          this.activeSession.credit(event.frames);
-        }
-        if (event.type === "event") {
-          this.activeSession?.receive(event.event);
-          if (this.activeSession?.isTerminal) this.activeSession = undefined;
-        }
-      };
-      worker.onerror = () => {
-        if (this.worker !== worker) return;
-        const wasPrepared = this.prepared;
-        this.prepared = false;
-        this.worker = undefined;
-        worker.terminate();
-        if (!wasPrepared) {
-          reject(new Error("local Whisper worker failed"));
-          return;
-        }
-        this.activeSession?.fail("local Whisper worker failed");
-        this.activeSession = undefined;
-      };
-      worker.postMessage({ type: "prepare", requestId });
+    const preparing = new Promise<void>((resolve, reject) => {
+      this.pendingPrepare = { generation, requestId, worker, resolve, reject };
     });
+    worker.onmessage = (message) => this.handleWorkerMessage(worker, generation, message.data);
+    worker.onerror = () => this.invalidateWorker(
+      worker,
+      generation,
+      new Error("local Whisper worker failed"),
+      { code: "INTERNAL", message: "local Whisper worker failed" },
+    );
+    try {
+      worker.postMessage({ type: "prepare", requestId });
+    } catch (error) {
+      this.invalidateWorker(worker, generation, normalizeError(error, "local Whisper worker failed"));
+    }
+    return preparing;
+  }
+
+  private handleWorkerMessage(worker: WorkerLike, generation: number, event: WorkerEvent): void {
+    if (!this.isCurrentWorker(worker, generation)) return;
+
+    if (event.type === "progress") {
+      if (this.pendingPrepare?.requestId === event.requestId) this.options.onProgress?.(event.progress);
+      return;
+    }
+    if (event.type === "prepared") {
+      const pending = this.pendingPrepare;
+      if (!pending || pending.requestId !== event.requestId) return;
+      if (this.disposed || !this.isCurrentWorker(worker, generation)) {
+        this.settlePrepare(worker, generation, new Error("engine is disposed"));
+        return;
+      }
+      this.prepared = true;
+      this.settlePrepare(worker, generation);
+      return;
+    }
+    if (event.type === "prepare.error") {
+      if (this.pendingPrepare?.requestId !== event.requestId) return;
+      this.invalidateWorker(worker, generation, new Error(event.message || "local Whisper preparation failed"));
+      return;
+    }
+    if (event.type === "inference.started") {
+      this.startInferenceWatchdog(worker, generation, event.sessionId, event.token);
+      return;
+    }
+    if (event.type === "inference.finished") {
+      this.finishInferenceWatchdog(worker, generation, event.sessionId, event.token);
+      return;
+    }
+    if (event.type === "credit" && this.activeSession?.sessionId === event.sessionId) {
+      this.activeSession.credit(event.frames);
+      return;
+    }
+    if (event.type === "event") {
+      this.activeSession?.receive(event.event);
+      if (this.activeSession?.isTerminal) this.activeSession = undefined;
+    }
+  }
+
+  private startInferenceWatchdog(
+    worker: WorkerLike,
+    generation: number,
+    sessionId: string,
+    token: number,
+  ): void {
+    if (this.activeSession?.sessionId !== sessionId) return;
+    this.clearInferenceWatchdog();
+    let watchdog: InferenceWatchdog;
+    const timer = setTimeout(
+      () => this.handleInferenceTimeout(watchdog),
+      this.options.inferenceTimeoutMs ?? 30_000,
+    );
+    watchdog = {
+      generation,
+      sessionId,
+      token,
+      worker,
+      timer,
+    };
+    this.inferenceWatchdog = watchdog;
+  }
+
+  private finishInferenceWatchdog(
+    worker: WorkerLike,
+    generation: number,
+    sessionId: string,
+    token: number,
+  ): void {
+    const watchdog = this.inferenceWatchdog;
+    if (
+      watchdog?.worker === worker
+      && watchdog.generation === generation
+      && watchdog.sessionId === sessionId
+      && watchdog.token === token
+    ) {
+      this.clearInferenceWatchdog();
+    }
+  }
+
+  private handleInferenceTimeout(watchdog: InferenceWatchdog): void {
+    if (this.inferenceWatchdog !== watchdog || !this.isCurrentWorker(watchdog.worker, watchdog.generation)) return;
+    this.clearInferenceWatchdog();
+    const matchingSession = this.activeSession?.sessionId === watchdog.sessionId;
+    this.invalidateWorker(
+      watchdog.worker,
+      watchdog.generation,
+      new Error("Local transcription timed out"),
+      matchingSession
+        ? { code: "TIMEOUT", message: "Local transcription timed out" }
+        : { code: "INTERNAL", message: "local Whisper worker failed" },
+    );
+  }
+
+  private invalidateWorker(
+    worker: WorkerLike,
+    generation: number,
+    error: Error,
+    sessionFailure?: { code: "INTERNAL" | "TIMEOUT"; message: string },
+  ): void {
+    if (!this.isCurrentWorker(worker, generation)) return;
+    this.prepared = false;
+    this.clearInferenceWatchdog();
+    worker.onmessage = null;
+    worker.onerror = null;
+    this.worker = undefined;
+    this.settlePrepare(worker, generation, error);
+    try {
+      worker.terminate();
+    } catch {
+      // The worker has already been detached and cannot affect engine state.
+    }
+    if (sessionFailure) {
+      this.activeSession?.fail(sessionFailure.code, sessionFailure.message);
+      this.activeSession = undefined;
+    }
+  }
+
+  private settlePrepare(worker: WorkerLike, generation: number, error?: Error): void {
+    const pending = this.pendingPrepare;
+    if (!pending || pending.worker !== worker || pending.generation !== generation) return;
+    this.pendingPrepare = undefined;
+    if (error) pending.reject(error);
+    else pending.resolve();
+  }
+
+  private clearInferenceWatchdog(): void {
+    if (!this.inferenceWatchdog) return;
+    clearTimeout(this.inferenceWatchdog.timer);
+    this.inferenceWatchdog = undefined;
+  }
+
+  private isCurrentWorker(worker: WorkerLike, generation: number): boolean {
+    return !this.disposed && this.worker === worker && this.workerGeneration === generation;
   }
 
   private assertAvailable() {
@@ -210,4 +396,8 @@ export class LocalWhisperEngine implements TranscriptionEngine {
 
 function defaultWorkerFactory(): WorkerLike {
   return new Worker(new URL("./worker/localWhisper.worker.js", import.meta.url), { type: "module" }) as unknown as WorkerLike;
+}
+
+function normalizeError(error: unknown, fallback: string): Error {
+  return error instanceof Error ? error : new Error(typeof error === "string" && error ? error : fallback);
 }

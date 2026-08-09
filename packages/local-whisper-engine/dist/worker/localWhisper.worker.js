@@ -5,29 +5,13 @@ const FRAME_MS = 20;
 const FRAME_SAMPLES = 320;
 const VAD_WINDOW_SAMPLES = 512;
 const SAMPLE_RATE = 16_000;
-/** Distinguishes a timed-out transcription from any other transcribe() rejection. */
-class TranscribeTimeoutError extends Error {
-}
 export function createWorkerController(runtime, post, options = {}) {
     const maxBufferedFrames = options.maxBufferedFrames ?? 3000;
-    const transcribeTimeoutMs = options.transcribeTimeoutMs ?? 30_000;
     const now = options.now ?? (() => performance.now());
     let loadAbort = new AbortController();
     let active;
     let commandQueue = Promise.resolve();
-    /**
-     * Races runtime.transcribe() against transcribeTimeoutMs. The WASM build has no GPU
-     * acceleration, so a pathologically slow or hung whisper_full() call is plausible, and
-     * without this the session would hang forever with no error and no "stopped" state.
-     * The timer is cleared on BOTH settle paths so a late-firing timer can never reject an
-     * already-resolved promise, and so it does not keep the event loop alive.
-     */
-    const runTranscribe = (session, samples) => {
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new TranscribeTimeoutError("Local transcription timed out")), transcribeTimeoutMs);
-            runtime.transcribe(samples, session.abort.signal).then((result) => { clearTimeout(timer); resolve(result); }, (error) => { clearTimeout(timer); reject(error); });
-        });
-    };
+    let inferenceToken = 0;
     const emit = (session, event) => {
         post({
             type: "event",
@@ -82,8 +66,19 @@ export function createWorkerController(runtime, post, options = {}) {
         if (samples.length === 0 || session.terminal)
             return;
         const startedAt = now();
+        const token = ++inferenceToken;
+        post({ type: "inference.started", sessionId: session.request.sessionId, token });
         try {
-            const result = await runTranscribe(session, samples);
+            let result;
+            try {
+                // The Embind call inside runtime.transcribe() is synchronous. The main-window
+                // engine supervises this lifecycle because a timer on this worker's event loop
+                // cannot run while whisper_full() is blocked.
+                result = await runtime.transcribe(samples, session.abort.signal);
+            }
+            finally {
+                post({ type: "inference.finished", sessionId: session.request.sessionId, token });
+            }
             if (session.terminal || session.abort.signal.aborted)
                 return;
             const elapsedMs = now() - startedAt;
@@ -121,7 +116,7 @@ export function createWorkerController(runtime, post, options = {}) {
             session.abort.abort();
             emit(session, {
                 type: "error",
-                code: error instanceof TranscribeTimeoutError ? "TIMEOUT" : "INTERNAL",
+                code: "INTERNAL",
                 fatal: true,
                 message: error instanceof Error ? error.message : "Local transcription failed",
             });

@@ -53,4 +53,5 @@ describeEngineContract("local whisper", () => new LocalWhisperEngine({ workerFac
 // selection, windowFrames-based draining, per-window revisions, transcribe
 // timeouts) tested the old fixed-window runtime this file
 // replaced and no longer apply -- there is no more "window", no per-window
-// revision bump, and no transcribeTimeoutMs option.
+// revision bump, and no worker-side transcribeTimeoutMs option. Synchronous
+// WASM inference is supervised by LocalWhisperEngine's separate event loop.
