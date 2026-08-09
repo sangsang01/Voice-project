@@ -232,10 +232,26 @@ describe("worker controller", () => {
     expect(engineEvents(events).filter((event) => event.type === "segment.upsert")).toHaveLength(4);
   });
 
-  it("does not warn when every transcription is faster than its audio", async () => {
+  it("does not warn when nonzero transcriptions are faster than their audio", async () => {
     const { post, events } = collect();
     const clock = { value: 0 };
-    const controller = createWorkerController(performanceRuntime([0, 0, 0, 0], clock), post, {
+    // The first utterance is 356ms; subsequent utterances are 456ms.
+    const controller = createWorkerController(performanceRuntime([300, 400, 400, 400], clock), post, {
+      now: () => clock.value,
+    });
+
+    await controller.handle({ type: "prepare", requestId: 1 });
+    await controller.handle({ type: "open", request });
+    await pushUtterances(controller, 4);
+
+    expect(engineEvents(events).filter((event) => event.type === "warning" && event.code === "DEGRADED_PERFORMANCE")).toHaveLength(0);
+  });
+
+  it("treats transcription matching audio duration as realtime", async () => {
+    const { post, events } = collect();
+    const clock = { value: 0 };
+    // Equality is not slower-than: the first utterance is 356ms, then 456ms each.
+    const controller = createWorkerController(performanceRuntime([356, 456, 456, 456], clock), post, {
       now: () => clock.value,
     });
 
@@ -258,6 +274,21 @@ describe("worker controller", () => {
     await pushUtterances(controller, 4);
 
     expect(engineEvents(events).filter((event) => event.type === "warning" && event.code === "DEGRADED_PERFORMANCE")).toHaveLength(0);
+  });
+
+  it("rearms after a fast transcription and continues emitting segments", async () => {
+    const { post, events } = collect();
+    const clock = { value: 0 };
+    const controller = createWorkerController(performanceRuntime([1_000, 1_000, 1_000, 0, 1_000, 1_000, 1_000], clock), post, {
+      now: () => clock.value,
+    });
+
+    await controller.handle({ type: "prepare", requestId: 1 });
+    await controller.handle({ type: "open", request });
+    await pushUtterances(controller, 7);
+
+    expect(engineEvents(events).filter((event) => event.type === "warning" && event.code === "DEGRADED_PERFORMANCE")).toHaveLength(2);
+    expect(engineEvents(events).filter((event) => event.type === "segment.upsert")).toHaveLength(7);
   });
 
   it("times out a hung transcription as a fatal error, exactly once", async () => {
