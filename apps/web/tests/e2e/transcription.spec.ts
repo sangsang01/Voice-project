@@ -134,7 +134,9 @@ async function installRealBridgeMicrophoneSeam(page: Page) {
       const binary = atob(base64);
       const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0)).buffer;
       const view = new DataView(bytes);
-      if (fourCc(view, 0) !== "RIFF" || fourCc(view, 8) !== "WAVE") throw new Error("Fixture is not a WAV file");
+      if (view.byteLength < 12 || fourCc(view, 0) !== "RIFF" || fourCc(view, 8) !== "WAVE") {
+        throw new Error("Fixture is not a WAV file");
+      }
 
       let channels = 0;
       let sampleRate = 0;
@@ -146,7 +148,9 @@ async function installRealBridgeMicrophoneSeam(page: Page) {
         const chunk = fourCc(view, offset);
         const length = view.getUint32(offset + 4, true);
         const payload = offset + 8;
+        if (payload + length > view.byteLength) throw new Error("Fixture WAV chunk exceeds file bounds");
         if (chunk === "fmt ") {
+          if (length < 16) throw new Error("Fixture WAV format chunk is truncated");
           format = view.getUint16(payload, true);
           channels = view.getUint16(payload + 2, true);
           sampleRate = view.getUint32(payload + 4, true);
@@ -158,10 +162,14 @@ async function installRealBridgeMicrophoneSeam(page: Page) {
         }
         offset = payload + length + (length % 2);
       }
-      if (format !== 1 || channels !== 1 || sampleRate !== 16_000 || bitsPerSample !== 16 || dataOffset < 0) {
+      if (format !== 1 || channels !== 1 || sampleRate !== 16_000 || bitsPerSample !== 16 || dataOffset < 0 || dataLength % 2 !== 0) {
         throw new Error("Fixture must be 16 kHz mono PCM s16le");
       }
-      return new Int16Array(bytes.slice(dataOffset, dataOffset + dataLength));
+      const samples = new Int16Array(dataLength / 2);
+      for (let index = 0; index < samples.length; index += 1) {
+        samples[index] = view.getInt16(dataOffset + index * 2, true);
+      }
+      return samples;
     };
 
     const emitFrame = (samples: Int16Array) => {
@@ -272,30 +280,24 @@ test("a reload reuses the fake cached local model path", async ({ page }) => {
   await expect.poll(() => page.evaluate(() => (window as Window & { __transcriptionE2e: { cacheHits: number } }).__transcriptionE2e.cacheHits)).toBe(1);
 });
 
-test("benchmark: reports non-blocking synthetic fixture metrics", async ({ page }) => {
+test("benchmark: reports synthetic transcription UI lifecycle timings", async ({ page }) => {
   await installBrowserFakes(page);
   await page.goto("/");
-  const fixture = await readFile(new URL("../fixtures/four-language.wav", import.meta.url));
-  expect(fixture.byteLength).toBe(32_044);
   const startedAt = performance.now();
   await selectEnglishAndStart(page);
   await expect(page.getByText("synthetic provisional")).toBeVisible();
-  const firstProvisionalLatencyMs = Math.round(performance.now() - startedAt);
+  const firstProvisionalUiMs = Math.round(performance.now() - startedAt);
   await page.getByRole("button", { name: "Stop" }).click();
   await expect(page.getByText("synthetic final")).toBeVisible();
-  const finalLatencyMs = Math.round(performance.now() - startedAt);
+  const finalUiMs = Math.round(performance.now() - startedAt);
 
-  const metrics = {
-    firstProvisionalLatencyMs,
-    finalLatencyMs,
-    realtimeFactor: Number((finalLatencyMs / 250).toFixed(2)),
-    peakQueuedAudioMs: 0,
-    expectedLabels: ["und"],
-    detectedLabels: ["und"],
-    fixture: "four-language.wav (synthetic silence; accuracy intentionally not scored)",
+  const timings = {
+    firstProvisionalUiMs,
+    finalUiMs,
+    scope: "synthetic worker events; audio inference and accuracy are not measured",
   };
-  console.log(`TRANSCRIPTION_BENCHMARK ${JSON.stringify(metrics)}`);
-  expect(finalLatencyMs).toBeGreaterThanOrEqual(firstProvisionalLatencyMs);
+  console.log(`TRANSCRIPTION_LIFECYCLE_TIMING ${JSON.stringify(timings)}`);
+  expect(finalUiMs).toBeGreaterThanOrEqual(firstProvisionalUiMs);
 });
 
 test("transcribes the JFK fixture through the real browser worker, VAD, and whisper.cpp WASM bridge", async ({ page }) => {
