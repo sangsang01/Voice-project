@@ -15,6 +15,8 @@ export interface VadGateConfig {
 export declare const VAD_DEFAULTS: VadGateConfig;
 export type VadDecision = {
     type: "idle";
+    /** Earliest padded candidate-onset timestamp the worker must retain. */
+    retainFromMs?: number;
 } | {
     type: "speaking";
 } | {

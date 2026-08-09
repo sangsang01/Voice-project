@@ -265,6 +265,15 @@ export function createWorkerController(
       for (let index = 0; index < probs.length; index += 1) {
         const windowStartMs = (session.windowIndex++ * VAD_WINDOW_SAMPLES * 1000) / SAMPLE_RATE;
         const decision = session.gate.push(probs[index]!, windowStartMs);
+        if (decision.type === "idle") {
+          // Pure idle needs only enough pre-roll for speech beginning in the
+          // next VAD window. A qualifying sub-minimum run carries its exact
+          // padded onset so trimming cannot cross audio it may still need.
+          const retainFromMs = decision.retainFromMs
+            ?? (windowStartMs + vadConfig.windowMs - vadConfig.speechPadMs);
+          trimAudio(session, retainFromMs);
+          continue;
+        }
         if (decision.type !== "flush") continue;
         if (decision.reason === "max-duration") {
           session.pendingMaxFlush = decision;

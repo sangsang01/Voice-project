@@ -80,13 +80,42 @@ describe("createVadGate", () => {
 
   it("force-flushes an unbroken monologue at maxSpeechMs and keeps listening", () => {
     const gate = createVadGate();
-    const total = windowsFor(VAD_DEFAULTS.maxSpeechMs) + 5;
+    const total = windowsFor(VAD_DEFAULTS.maxSpeechMs) + windowsFor(VAD_DEFAULTS.minSpeechMs) + 1;
     const decisions = feed(gate, 0.9, total);
 
     const flush = decisions.find((decision) => decision.type === "flush");
     expect(flush).toMatchObject({ reason: "max-duration" });
     // Still mid-speech, so it must resume speaking rather than dropping to idle.
     expect(decisions.at(-1)).toEqual({ type: "speaking" });
+  });
+
+  it("does not flush an overlap-only continuation when silence starts immediately after a max split", () => {
+    const gate = createVadGate();
+    const speechWindows = windowsFor(VAD_DEFAULTS.maxSpeechMs);
+    const speech = feed(gate, 0.9, speechWindows);
+    expect(speech.filter((decision) => decision.type === "flush")).toHaveLength(1);
+
+    const silence = feed(gate, 0.1, windowsFor(VAD_DEFAULTS.minSilenceMs) + 1, speechWindows);
+
+    expect(silence.every((decision) => decision.type === "idle")).toBe(true);
+  });
+
+  it("drops a post-max speech tail shorter than minSpeechMs", () => {
+    const gate = createVadGate();
+    const firstSpeechWindows = windowsFor(VAD_DEFAULTS.maxSpeechMs);
+    feed(gate, 0.9, firstSpeechWindows);
+    const shortTailWindows = windowsFor(VAD_DEFAULTS.minSpeechMs) - 2;
+    const tail = feed(gate, 0.9, shortTailWindows, firstSpeechWindows);
+    expect(tail.every((decision) => decision.type === "idle")).toBe(true);
+
+    const silence = feed(
+      gate,
+      0.1,
+      windowsFor(VAD_DEFAULTS.minSilenceMs) + 1,
+      firstSpeechWindows + shortTailWindows,
+    );
+
+    expect(silence.every((decision) => decision.type === "idle")).toBe(true);
   });
 
   it("separates two utterances split by a pause", () => {
@@ -155,7 +184,7 @@ describe("createVadGate", () => {
 
   it("chains a second max-duration flush when the monologue keeps going", () => {
     const gate = createVadGate();
-    const total = windowsFor(2 * VAD_DEFAULTS.maxSpeechMs) + 5;
+    const total = windowsFor(2 * VAD_DEFAULTS.maxSpeechMs) + windowsFor(VAD_DEFAULTS.minSpeechMs) + 1;
     const decisions = feed(gate, 0.9, total);
 
     const flushes = decisions.filter((decision) => decision.type === "flush");

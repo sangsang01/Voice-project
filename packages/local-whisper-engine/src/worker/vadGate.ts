@@ -23,7 +23,11 @@ export const VAD_DEFAULTS: VadGateConfig = {
 };
 
 export type VadDecision =
-  | { type: "idle" }
+  | {
+      type: "idle";
+      /** Earliest padded candidate-onset timestamp the worker must retain. */
+      retainFromMs?: number;
+    }
   | { type: "speaking" }
   | { type: "flush"; startMs: number; endMs: number; reason: "silence" | "max-duration" };
 
@@ -66,6 +70,11 @@ export function createVadGate(overrides: Partial<VadGateConfig> = {}): VadGate {
     reason,
   });
 
+  const qualifying = (): VadDecision => ({
+    type: "idle",
+    retainFromMs: Math.max(0, (onsetMs ?? 0) - config.speechPadMs),
+  });
+
   return {
     push(probability, windowStartMs) {
       const windowEndMs = windowStartMs + config.windowMs;
@@ -83,12 +92,14 @@ export function createVadGate(overrides: Partial<VadGateConfig> = {}): VadGate {
         // listening, starting the next utterance where this one ended.
         if (speaking && windowEndMs - (onsetMs ?? 0) >= config.maxSpeechMs) {
           const decision = utterance(windowEndMs, "max-duration");
+          speaking = false;
           onsetMs = windowEndMs;
           speechMs = 0;
           silenceMs = 0;
+          lastVoiceEndMs = windowEndMs;
           return decision;
         }
-        return speaking ? SPEAKING : IDLE;
+        return speaking ? SPEAKING : qualifying();
       }
 
       // Below threshold.

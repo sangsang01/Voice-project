@@ -33,6 +33,10 @@ export function createVadGate(overrides = {}) {
         endMs: endMs + config.speechPadMs,
         reason,
     });
+    const qualifying = () => ({
+        type: "idle",
+        retainFromMs: Math.max(0, (onsetMs ?? 0) - config.speechPadMs),
+    });
     return {
         push(probability, windowStartMs) {
             const windowEndMs = windowStartMs + config.windowMs;
@@ -49,12 +53,14 @@ export function createVadGate(overrides = {}) {
                 // listening, starting the next utterance where this one ended.
                 if (speaking && windowEndMs - (onsetMs ?? 0) >= config.maxSpeechMs) {
                     const decision = utterance(windowEndMs, "max-duration");
+                    speaking = false;
                     onsetMs = windowEndMs;
                     speechMs = 0;
                     silenceMs = 0;
+                    lastVoiceEndMs = windowEndMs;
                     return decision;
                 }
-                return speaking ? SPEAKING : IDLE;
+                return speaking ? SPEAKING : qualifying();
             }
             // Below threshold.
             if (!speaking) {

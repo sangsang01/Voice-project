@@ -233,6 +233,76 @@ describe("worker controller", () => {
     expect(vadReset).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    { label: "immediate silence", tailFrames: 0 },
+    { label: "a sub-minimum speech tail", tailFrames: 8 },
+  ])("does not transcribe an overlap-only continuation after max duration followed by $label", async ({ tailFrames }) => {
+    const { post, events } = collect();
+    let probability = 0.9;
+    const transcribe = vi.fn(async () => ({ text: "utterance", language: "en", languageProbability: 1 }));
+    const { runtime } = fakeRuntime({
+      vadProbs: (samples) => new Float32Array(Math.floor(samples.length / 512)).fill(probability),
+      transcribe,
+    });
+    const controller = createWorkerController(runtime, post);
+
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 1_252 + tailFrames; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+    probability = 0.05;
+    for (let index = 1_252 + tailFrames; index < 1_252 + tailFrames + 40; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    expect(transcribe).toHaveBeenCalledTimes(1);
+    expect(engineEvents(events).filter((event) => event.type === "segment.upsert")).toHaveLength(1);
+  });
+
+  it("keeps idle silence bounded so speech resumes after more than the buffer cap", async () => {
+    const { post, events } = collect();
+    let probability = 0.05;
+    const transcribe = vi.fn(async () => ({ text: "after silence", language: "en", languageProbability: 1 }));
+    const { runtime } = fakeRuntime({
+      vadProbs: (samples) => new Float32Array(Math.floor(samples.length / 512)).fill(probability),
+      transcribe,
+    });
+    const controller = createWorkerController(runtime, post);
+    // A multiple of eight 320-sample frames lands exactly on a 512-sample VAD
+    // boundary, making the expected 100ms pre-roll unambiguous.
+    const silenceFrames = 3_104;
+
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < silenceFrames; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    const creditsBeforeSpeech = events.reduce((total, event) => event.type === "credit" ? total + event.frames : total, 0);
+    const maximumIdleFrames = Math.ceil((VAD_DEFAULTS.speechPadMs + VAD_DEFAULTS.windowMs) / 20);
+    expect(creditsBeforeSpeech).toBeGreaterThanOrEqual(silenceFrames - maximumIdleFrames);
+    expect(engineEvents(events).filter((event) => event.type === "warning" && event.code === "AUDIO_GAP")).toHaveLength(0);
+
+    probability = 0.9;
+    for (let index = silenceFrames; index < silenceFrames + 20; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+    probability = 0.05;
+    for (let index = silenceFrames + 20; index < silenceFrames + 60; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    expect(transcribe).toHaveBeenCalledOnce();
+    const segment = engineEvents(events).find((event) => event.type === "segment.upsert");
+    expect(segment).toMatchObject({ type: "segment.upsert", segment: { text: "after silence" } });
+    if (segment?.type !== "segment.upsert") throw new Error("expected a segment");
+    expect(segment.segment.startMs).toBe((silenceFrames * 20) - VAD_DEFAULTS.speechPadMs);
+    expect(transcribe.mock.calls[0]![0].length).toBe((segment.segment.endMs - segment.segment.startMs) * 16);
+
+    await controller.handle({ type: "stop", sessionId: SESSION });
+    const totalCredits = events.reduce((total, event) => event.type === "credit" ? total + event.frames : total, 0);
+    expect(totalCredits).toBe(silenceFrames + 60);
+  });
+
   it("emits one final segment per detected utterance", async () => {
     const { post, events } = collect();
     const { runtime } = fakeRuntime();
@@ -338,9 +408,9 @@ describe("worker controller", () => {
     }
     await controller.handle({ type: "stop", sessionId: SESSION });
 
-    expect(events.filter((event) => event.type === "credit")).toEqual([
-      { type: "credit", sessionId: SESSION, frames: 10 },
-    ]);
+    const credits = events.filter((event) => event.type === "credit");
+    expect(credits.reduce((total, event) => total + event.frames, 0)).toBe(10);
+    expect(credits.every((event) => event.sessionId === SESSION && event.frames > 0)).toBe(true);
     expect(vadReset).toHaveBeenCalledTimes(2);
     expect(engineEvents(events).at(-1)).toMatchObject({ type: "state", state: "stopped" });
   });
