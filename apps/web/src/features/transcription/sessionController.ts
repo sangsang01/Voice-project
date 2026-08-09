@@ -59,6 +59,7 @@ export class SessionController {
   private engine: TranscriptionEngine | undefined;
   private currentAttempt: StartAttempt | undefined;
   private releasing: Promise<void> | undefined;
+  private readonly privateDisposals = new Set<Promise<void>>();
   private disposal: Promise<void> | undefined;
   private disposed = false;
 
@@ -108,6 +109,7 @@ export class SessionController {
         await this.clearActive();
       } finally {
         await this.disposePrivateEngine(attempt);
+        await this.awaitPrivateDisposals();
         await this.dropEngine();
       }
     })();
@@ -266,8 +268,17 @@ export class SessionController {
 
   private disposePrivateEngine(attempt: StartAttempt | undefined): Promise<void> | undefined {
     if (!attempt || !attempt.ownsPrivateEngine || attempt.publishedEngine || !attempt.engine) return undefined;
-    attempt.disposal ??= attempt.engine.dispose().catch(() => undefined);
+    if (!attempt.disposal) {
+      const disposal = attempt.engine.dispose().catch(() => undefined);
+      attempt.disposal = disposal;
+      this.privateDisposals.add(disposal);
+      void disposal.then(() => this.privateDisposals.delete(disposal));
+    }
     return attempt.disposal;
+  }
+
+  private async awaitPrivateDisposals(): Promise<void> {
+    while (this.privateDisposals.size > 0) await Promise.all(this.privateDisposals);
   }
 
   private reportProgress(engine: TranscriptionEngine, progress: number): void {

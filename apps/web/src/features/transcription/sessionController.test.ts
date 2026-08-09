@@ -252,6 +252,33 @@ describe("SessionController inspection cancellation", () => {
     expect(engine.dispose).toHaveBeenCalledTimes(1);
   });
 
+  it("awaits private-engine disposal detached by an earlier stop", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    engine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
+    let resolveEngineDispose: () => void = () => undefined;
+    engine.dispose.mockImplementation(
+      () => new Promise<undefined>((resolve) => { resolveEngineDispose = () => resolve(undefined); }),
+    );
+    const { controller } = createController(engine);
+    const start = controller.start(["en-US"]);
+    await vi.waitFor(() => expect(engine.prepare).toHaveBeenCalledTimes(1));
+    await controller.stop();
+    await start;
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+
+    const disposing = controller.dispose();
+    const firstOutcome = await Promise.race([
+      disposing.then(() => "disposed" as const),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 0)),
+    ]);
+    expect(firstOutcome).toBe("pending");
+
+    resolveEngineDispose();
+    await disposing;
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+  });
+
   it("disposes the cached engine even when active-session release fails", async () => {
     const engine = new PendingInspectionEngine();
     engine.inspect.mockResolvedValue({ available: true });
