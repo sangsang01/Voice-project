@@ -66,7 +66,7 @@ unit-testable without compiling WASM.
 
 The inference watchdog runs in `LocalWhisperEngine` on the main-window event
 loop. Production budgets twenty times the actual inference audio duration, with
-a 60-second floor and a finite ten-minute ceiling; tests can inject an exact
+a two-minute floor and a finite ten-minute ceiling; tests can inject an exact
 fixed override. The worker reports inference start and finish around the
 synchronous Embind call, so the main window can terminate a blocked worker and
 emit a fatal `TIMEOUT`. A timer inside the inference worker cannot provide that

@@ -467,7 +467,7 @@ describe("LocalWhisperEngine", () => {
     session.subscribe((event) => events.push(event));
 
     worker.emit({ type: "inference.started", sessionId: request.sessionId, token: 1, audioDurationMs: 3_500 });
-    await vi.advanceTimersByTimeAsync(69_999);
+    await vi.advanceTimersByTimeAsync(119_999);
     expect(worker.terminateCalls).toBe(0);
     await vi.advanceTimersByTimeAsync(1);
 
