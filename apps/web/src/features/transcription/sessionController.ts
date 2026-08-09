@@ -34,6 +34,7 @@ interface ActiveSession {
 }
 
 type ReleaseMode = "stop" | "cancel" | "already-terminal";
+type AfterPublishFailureMode = "throw" | "aggregate";
 
 interface StartAttempt {
   readonly sessionId: string;
@@ -434,9 +435,35 @@ export class SessionController {
   private async clearActive(nextSessionId: string = crypto.randomUUID()): Promise<void> {
     const active = this.active;
     this.active = undefined;
-    this.dispatch({ type: "clear", nextSessionId });
-    if (active) await this.release(active, "cancel");
-    else await this.releasing;
+    if (active) {
+      await this.release(
+        active,
+        "cancel",
+        () => this.dispatch({ type: "clear", nextSessionId }),
+        "aggregate",
+      );
+      return;
+    }
+    const releasing = this.releasing;
+    let dispatchFailed = false;
+    let dispatchFailure: unknown;
+    try {
+      this.dispatch({ type: "clear", nextSessionId });
+    } catch (error) {
+      dispatchFailed = true;
+      dispatchFailure = error;
+    }
+    let releaseFailed = false;
+    let releaseFailure: unknown;
+    try { await releasing; }
+    catch (error) {
+      releaseFailed = true;
+      releaseFailure = error;
+    }
+    // The pending release is later in the cleanup order and retains the
+    // established precedence over a clear-dispatch failure.
+    if (releaseFailed) throw releaseFailure;
+    if (dispatchFailed) throw dispatchFailure;
   }
 
   private dropEngine(): Promise<void> {
@@ -449,7 +476,12 @@ export class SessionController {
   // Publish ownership before invoking engine or capture callbacks: either can
   // synchronously replay terminal events or trigger a concurrent controller call.
   // The first release mode wins and all later callers await this exact promise.
-  private release(active: ActiveSession, mode: ReleaseMode, afterPublish?: () => void): Promise<void> {
+  private release(
+    active: ActiveSession,
+    mode: ReleaseMode,
+    afterPublish?: () => void,
+    afterPublishFailureMode: AfterPublishFailureMode = "throw",
+  ): Promise<void> {
     if (!active.release) {
       let resolveRelease: () => void = () => undefined;
       let rejectRelease: (error: unknown) => void = () => undefined;
@@ -466,11 +498,16 @@ export class SessionController {
       if (mode === "already-terminal") this.observeTerminalRelease(active, active.release);
       let dispatchFailed = false;
       let dispatchFailure: unknown;
+      let dispatching = Promise.resolve();
       try {
         afterPublish?.();
       } catch (error) {
-        dispatchFailed = true;
-        dispatchFailure = error;
+        if (afterPublishFailureMode === "aggregate") {
+          dispatching = Promise.reject(error);
+        } else {
+          dispatchFailed = true;
+          dispatchFailure = error;
+        }
       }
 
       if (mode === "stop") active.retiringEvents = "stop";
@@ -505,7 +542,7 @@ export class SessionController {
 
       // Match the established nested-finally precedence: every later cleanup
       // failure overrides an earlier one, while all operations still settle.
-      void Promise.allSettled([aborting, sessionOperation, stoppingMicrophone, detaching]).then((results) => {
+      void Promise.allSettled([dispatching, aborting, sessionOperation, stoppingMicrophone, detaching]).then((results) => {
         let failure: PromiseRejectedResult | undefined;
         for (const result of results) {
           if (result.status === "rejected") failure = result;

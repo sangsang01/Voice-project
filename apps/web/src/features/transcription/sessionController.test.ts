@@ -409,6 +409,153 @@ describe("SessionController terminal event ownership", () => {
 });
 
 describe("SessionController inspection cancellation", () => {
+  it.each(["stop", "clear", "dispose"] as const)("publishes clear cancellation before a reentrant dispatch %s", async (operation) => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    let resolveCancel: () => void = () => undefined;
+    (engine.session.cancel as ReturnType<typeof vi.fn>).mockImplementation(
+      () => new Promise<undefined>((resolve) => { resolveCancel = () => resolve(undefined); }),
+    );
+    let resolveMicrophoneStop: () => void = () => undefined;
+    const microphoneStop = vi.fn(
+      () => new Promise<void>((resolve) => { resolveMicrophoneStop = resolve; }),
+    );
+    let reentrant: Promise<void> | undefined;
+    let triggerReentrancy = false;
+    const dispatch = vi.fn((action: EngineEvent | { type: "clear"; nextSessionId: string }) => {
+      if (!triggerReentrancy || action.type !== "clear") return;
+      triggerReentrancy = false;
+      reentrant = operation === "stop"
+        ? controller.stop()
+        : operation === "clear"
+          ? controller.clear()
+          : controller.dispose();
+    });
+    const controller = new SessionController({
+      dispatch,
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+    });
+    await controller.start(["en-US"]);
+    triggerReentrancy = true;
+
+    let clearSettled = false;
+    let reentrantSettled = false;
+    const clearing = controller.clear().then(() => { clearSettled = true; });
+    await vi.waitFor(() => expect(engine.session.cancel).toHaveBeenCalledTimes(1));
+    const overlapping = reentrant?.then(() => { reentrantSettled = true; });
+    await Promise.resolve();
+
+    expect(clearSettled).toBe(false);
+    expect(reentrantSettled).toBe(false);
+    expect(engine.session.cancel).toHaveBeenCalledTimes(1);
+    expect(engine.session.stop).not.toHaveBeenCalled();
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(engine.dispose).not.toHaveBeenCalled();
+
+    resolveCancel();
+    await Promise.resolve();
+    expect(clearSettled).toBe(false);
+    expect(reentrantSettled).toBe(false);
+
+    resolveMicrophoneStop();
+    await Promise.all([clearing, overlapping]);
+    expect(engine.session.cancel).toHaveBeenCalledTimes(1);
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(engine.dispose).toHaveBeenCalledTimes(operation === "dispose" ? 1 : 0);
+
+    if (operation !== "dispose") await controller.dispose();
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("settles clear cleanup and preserves its later failure over a dispatch failure", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    (engine.session.cancel as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("engine cancel failed"));
+    const unsubscribe = vi.fn(() => { throw new Error("unsubscribe failed"); });
+    engine.session.subscribe = vi.fn(() => unsubscribe);
+    let rejectMicrophoneStop: (error: Error) => void = () => undefined;
+    const microphoneStop = vi.fn(
+      () => new Promise<void>((_resolve, reject) => { rejectMicrophoneStop = reject; }),
+    );
+    let throwClear = false;
+    const dispatch = vi.fn((action: EngineEvent | { type: "clear" }) => {
+      if (throwClear && action.type === "clear") throw new Error("dispatch failed");
+    });
+    const controller = new SessionController({
+      dispatch,
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+    });
+    await controller.start(["en-US"]);
+    throwClear = true;
+
+    let settled = false;
+    const clearing = controller.clear();
+    void clearing.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    await vi.waitFor(() => expect(unsubscribe).toHaveBeenCalledTimes(1));
+    expect(settled).toBe(false);
+    rejectMicrophoneStop(new Error("microphone stop failed"));
+
+    await expect(clearing).rejects.toThrow("unsubscribe failed");
+    expect(engine.session.cancel).toHaveBeenCalledTimes(1);
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["clear", "dispose"] as const)("awaits a pending terminal release when %s dispatch throws", async (operation) => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    let rejectMicrophoneStop: (error: Error) => void = () => undefined;
+    const microphoneStop = vi.fn(
+      () => new Promise<void>((_resolve, reject) => { rejectMicrophoneStop = reject; }),
+    );
+    let throwClear = false;
+    const dispatch = vi.fn((action: EngineEvent | { type: "clear" }) => {
+      if (throwClear && action.type === "clear") throw new Error("dispatch failed");
+    });
+    const controller = new SessionController({
+      dispatch,
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+      onLocalError: vi.fn(),
+    });
+    const sessionId = await controller.start(["en-US"]);
+    engine.emit({
+      type: "error", sessionId, sequence: 1, code: "INTERNAL", fatal: true, message: "worker failed",
+    });
+    await vi.waitFor(() => expect(microphoneStop).toHaveBeenCalledTimes(1));
+    throwClear = true;
+
+    let settled = false;
+    const overlapping = operation === "clear" ? controller.clear() : controller.dispose();
+    void overlapping.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+    expect(engine.dispose).not.toHaveBeenCalled();
+    rejectMicrophoneStop(new Error("microphone stop failed"));
+
+    await expect(overlapping).rejects.toThrow("microphone stop failed");
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(engine.dispose).toHaveBeenCalledTimes(operation === "dispose" ? 1 : 0);
+
+    if (operation !== "dispose") {
+      throwClear = false;
+      await controller.dispose();
+    }
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["stop", "clear", "dispose"] as const)("shares an active stop release with concurrent %s", async (concurrentOperation) => {
     const engine = new PendingInspectionEngine();
     engine.inspect.mockResolvedValue({ available: true });
