@@ -13,14 +13,14 @@ describe('App', () => {
     expect(screen.getByText('Press Start and speak — your words appear here.')).toBeInTheDocument()
   })
 
-  it('switches the controls and status while a recording session is active', () => {
+  it('shows preparation controls and status while the local model is loading', () => {
     render(<App />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Start' }))
 
     expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled()
-    expect(screen.getByRole('status')).toHaveTextContent('Listening')
+    expect(screen.getByRole('status')).toHaveTextContent('Preparing')
   })
 
   it('offers the clear and restart control for a fresh transcription session', () => {

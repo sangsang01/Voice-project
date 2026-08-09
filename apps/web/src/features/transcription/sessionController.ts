@@ -1,4 +1,4 @@
-import type { EngineEvent, PcmFrame, SessionRequest, TranscriptionEngine, TranscriptionSession } from "@voice/transcription-contracts";
+import type { EngineEvent, EngineInspection, PcmFrame, SessionRequest, TranscriptionEngine, TranscriptionSession } from "@voice/transcription-contracts";
 import { LocalWhisperEngine } from "@voice/local-whisper-engine";
 import type { MicrophoneCapture } from "./audio/microphone";
 import { startMicrophoneCapture } from "./audio/microphone";
@@ -104,7 +104,14 @@ export class SessionController {
     const abortController = new AbortController();
     let active: ActiveSession | undefined;
     try {
-      const inspection = await engine.inspect();
+      let inspection: EngineInspection;
+      try {
+        inspection = await engine.inspect();
+      } catch (error) {
+        if (token !== this.startToken) return sessionId;
+        throw error;
+      }
+      if (token !== this.startToken) return sessionId;
       if (!inspection.available) throw new Error(inspection.reason ?? "Local transcription is unavailable");
       await engine.prepare(request);
       if (token !== this.startToken) {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type {
   EngineEvent,
   EngineEventListener,
@@ -9,6 +9,27 @@ import type {
   TranscriptionSession,
 } from "@voice/transcription-contracts";
 import { describe, expect, it, vi } from "vitest";
+
+const defaultLocalEngine = vi.hoisted(() => ({
+  onProgress: undefined as ((progress: number) => void) | undefined,
+  inspect: vi.fn(async () => ({ available: true })),
+  prepare: vi.fn(async () => undefined),
+  open: vi.fn(),
+  dispose: vi.fn(async () => undefined),
+}));
+
+vi.mock("@voice/local-whisper-engine", () => ({
+  LocalWhisperEngine: class {
+    public readonly inspect = defaultLocalEngine.inspect;
+    public readonly prepare = defaultLocalEngine.prepare;
+    public readonly open = defaultLocalEngine.open;
+    public readonly dispose = defaultLocalEngine.dispose;
+
+    public constructor(options: { onProgress?: (progress: number) => void } = {}) {
+      defaultLocalEngine.onProgress = options.onProgress;
+    }
+  },
+}));
 import { TranscriptionAdapter } from "./TranscriptionAdapter";
 
 type EventWithoutSession<E extends EngineEvent = EngineEvent> = E extends EngineEvent
@@ -141,7 +162,22 @@ describe("TranscriptionAdapter", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
 
     expect(await screen.findByText("Preparing local model…")).toBeVisible();
-    expect(screen.getByRole("status")).toHaveTextContent("Listening");
+    expect(screen.getByRole("status")).toHaveTextContent("Preparing");
+    expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+  });
+
+  it("renders progress reported by the default local engine", async () => {
+    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
+    defaultLocalEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Preparing");
+    await waitFor(() => expect(defaultLocalEngine.onProgress).toEqual(expect.any(Function)));
+    act(() => defaultLocalEngine.onProgress?.(0.42));
+
+    expect(await screen.findByText("Preparing local model 42%")).toBeVisible();
+    expect(screen.getByRole("progressbar", { name: "Local model preparation" })).toHaveAttribute("value", "0.42");
   });
 
   it("surfaces unsupported local capabilities without preparing or opening an engine", async () => {
