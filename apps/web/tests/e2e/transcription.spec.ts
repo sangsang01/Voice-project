@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 
-type E2eMode = "normal" | "permission-denied" | "worker-crash" | "webgpu-disabled";
+type E2eMode = "normal" | "permission-denied" | "worker-crash";
 
 async function installBrowserFakes(page: Page, mode: E2eMode = "normal") {
   await page.addInitScript((selectedMode) => {
@@ -8,7 +9,6 @@ async function installBrowserFakes(page: Page, mode: E2eMode = "normal") {
 
     const state = {
       mode: selectedMode,
-      prepareDevices: [] as string[],
       prepareCount: Number(localStorage.getItem("fake-local-model-prepares") ?? "0"),
       cacheHits: 0,
     };
@@ -53,17 +53,12 @@ async function installBrowserFakes(page: Page, mode: E2eMode = "normal") {
 
       public constructor() { /* no-op */ }
 
-      public postMessage(message: { type: string; requestId?: number; device?: string; request?: { sessionId: string }; sessionId?: string }) {
+      public postMessage(message: { type: string; requestId?: number; request?: { sessionId: string }; sessionId?: string }) {
         if (message.type === "prepare") {
-          state.prepareDevices.push(message.device ?? "unknown");
-          if (selectedMode === "webgpu-disabled" && message.device === "webgpu") {
-            queueMicrotask(() => this.onmessage?.({ data: { type: "prepare.error", requestId: message.requestId, device: "webgpu", message: "WebGPU disabled for this test" } } as MessageEvent));
-            return;
-          }
           if (state.prepareCount > 0) state.cacheHits += 1;
           state.prepareCount += 1;
           localStorage.setItem("fake-local-model-prepares", String(state.prepareCount));
-          queueMicrotask(() => this.onmessage?.({ data: { type: "prepared", requestId: message.requestId, device: message.device } } as MessageEvent));
+          queueMicrotask(() => this.onmessage?.({ data: { type: "prepared", requestId: message.requestId } } as MessageEvent));
           return;
         }
         if (message.type === "open" && message.request) {
@@ -98,9 +93,127 @@ async function installBrowserFakes(page: Page, mode: E2eMode = "normal") {
   }, mode);
 }
 
-async function selectEnglishAndStart(page: Page) {
+async function installRealBridgeMicrophoneSeam(page: Page) {
+  await page.addInitScript(() => {
+    type Listener = (event: MessageEvent<unknown>) => void;
+
+    class FakeNode {
+      public connect() { return this; }
+      public disconnect() { /* Browser cleanup is intentionally harmless in the fake graph. */ }
+    }
+
+    const state: {
+      port?: { onmessage: Listener | null };
+      sequence: number;
+    } = { sequence: 0 };
+
+    class FakeAudioWorkletNode extends FakeNode {
+      public port: { onmessage: Listener | null } = { onmessage: null };
+      public constructor() {
+        super();
+        state.port = this.port;
+      }
+    }
+
+    class FakeAudioContext {
+      public audioWorklet = { addModule: async () => undefined };
+      public destination = new FakeNode();
+      public async resume() { /* no-op */ }
+      public async close() { /* no-op */ }
+      public createMediaStreamSource() { return new FakeNode(); }
+    }
+
+    const fourCc = (view: DataView, offset: number) => String.fromCharCode(
+      view.getUint8(offset),
+      view.getUint8(offset + 1),
+      view.getUint8(offset + 2),
+      view.getUint8(offset + 3),
+    );
+
+    const readFixture = (base64: string) => {
+      const binary = atob(base64);
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0)).buffer;
+      const view = new DataView(bytes);
+      if (fourCc(view, 0) !== "RIFF" || fourCc(view, 8) !== "WAVE") throw new Error("Fixture is not a WAV file");
+
+      let channels = 0;
+      let sampleRate = 0;
+      let bitsPerSample = 0;
+      let format = 0;
+      let dataOffset = -1;
+      let dataLength = 0;
+      for (let offset = 12; offset + 8 <= view.byteLength;) {
+        const chunk = fourCc(view, offset);
+        const length = view.getUint32(offset + 4, true);
+        const payload = offset + 8;
+        if (chunk === "fmt ") {
+          format = view.getUint16(payload, true);
+          channels = view.getUint16(payload + 2, true);
+          sampleRate = view.getUint32(payload + 4, true);
+          bitsPerSample = view.getUint16(payload + 14, true);
+        } else if (chunk === "data") {
+          dataOffset = payload;
+          dataLength = length;
+          break;
+        }
+        offset = payload + length + (length % 2);
+      }
+      if (format !== 1 || channels !== 1 || sampleRate !== 16_000 || bitsPerSample !== 16 || dataOffset < 0) {
+        throw new Error("Fixture must be 16 kHz mono PCM s16le");
+      }
+      return new Int16Array(bytes.slice(dataOffset, dataOffset + dataLength));
+    };
+
+    const emitFrame = (samples: Int16Array) => {
+      if (!state.port?.onmessage) throw new Error("AudioWorklet microphone seam is not ready");
+      const copy = samples.slice();
+      const sequence = state.sequence++;
+      state.port.onmessage({
+        data: {
+          type: "pcm-frame",
+          sequence,
+          startMs: sequence * 20,
+          samples: copy.buffer,
+        },
+      } as MessageEvent);
+    };
+
+    Object.defineProperty(window, "__realBridgeE2e", {
+      configurable: true,
+      value: {
+        async pushFixture(base64: string) {
+          const deadline = performance.now() + 10_000;
+          while (!state.port?.onmessage && performance.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          const samples = readFixture(base64);
+          // The opening 3.5s contains "And so, my fellow Americans". Keeping
+          // this recognizable excerpt bounds real WASM inference time while
+          // the repository still carries the complete upstream fixture.
+          const excerpt = samples.subarray(0, 16_000 * 3.5);
+          for (let offset = 0; offset < excerpt.length; offset += 320) {
+            const frame = new Int16Array(320);
+            frame.set(excerpt.subarray(offset, offset + 320));
+            emitFrame(frame);
+          }
+          // One second exceeds Silero's 500ms trailing-silence flush threshold.
+          for (let index = 0; index < 50; index += 1) emitFrame(new Int16Array(320));
+        },
+      },
+    });
+
+    Object.defineProperty(window, "AudioContext", { configurable: true, value: FakeAudioContext });
+    Object.defineProperty(window, "AudioWorkletNode", { configurable: true, value: FakeAudioWorkletNode });
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: async () => ({ getTracks: () => [{ stop() { /* no-op */ } }] }) },
+    });
+  });
+}
+
+async function selectEnglishAndStart(page: Page, timeout = 5_000) {
   await page.getByRole("button", { name: "Start", exact: true }).click();
-  await expect(page.getByRole("status")).toContainText("Listening");
+  await expect(page.getByRole("status")).toContainText("Listening", { timeout });
 }
 
 test("fake microphone starts and stops without loading a real model", async ({ page }) => {
@@ -159,24 +272,11 @@ test("a reload reuses the fake cached local model path", async ({ page }) => {
   await expect.poll(() => page.evaluate(() => (window as Window & { __transcriptionE2e: { cacheHits: number } }).__transcriptionE2e.cacheHits)).toBe(1);
 });
 
-test("WebGPU-disabled environments retry the local engine with WASM", async ({ page }) => {
-  await installBrowserFakes(page, "webgpu-disabled");
-  await page.goto("/");
-
-  await selectEnglishAndStart(page);
-
-  await expect.poll(() => page.evaluate(() => (window as Window & { __transcriptionE2e: { prepareDevices: string[] } }).__transcriptionE2e.prepareDevices)).toEqual(["webgpu", "wasm"]);
-});
-
 test("benchmark: reports non-blocking synthetic fixture metrics", async ({ page }) => {
   await installBrowserFakes(page);
   await page.goto("/");
-  const fixture = await page.evaluate(async () => {
-    const response = await fetch("/tests/fixtures/four-language.wav");
-    return { ok: response.ok, bytes: (await response.arrayBuffer()).byteLength };
-  });
-  expect(fixture.ok).toBe(true);
-  expect(fixture.bytes).toBeGreaterThan(44);
+  const fixture = await readFile(new URL("../fixtures/four-language.wav", import.meta.url));
+  expect(fixture.byteLength).toBe(32_044);
   const startedAt = performance.now();
   await selectEnglishAndStart(page);
   await expect(page.getByText("synthetic provisional")).toBeVisible();
@@ -196,4 +296,45 @@ test("benchmark: reports non-blocking synthetic fixture metrics", async ({ page 
   };
   console.log(`TRANSCRIPTION_BENCHMARK ${JSON.stringify(metrics)}`);
   expect(finalLatencyMs).toBeGreaterThanOrEqual(firstProvisionalLatencyMs);
+});
+
+test("transcribes the JFK fixture through the real browser worker, VAD, and whisper.cpp WASM bridge", async ({ page }) => {
+  test.setTimeout(180_000);
+  await installRealBridgeMicrophoneSeam(page);
+  await page.goto("/");
+
+  expect(await page.evaluate(() => crossOriginIsolated)).toBe(true);
+  for (const model of ["/models/ggml-tiny-q5_1.bin", "/models/ggml-silero-v6.2.0.bin"]) {
+    const status = await page.evaluate(async (url) => (await fetch(url)).status, model);
+    expect(status).toBe(200);
+  }
+  await expect(page.getByRole("button", { name: "English (US)" })).toHaveAttribute("aria-pressed", "true");
+
+  let started = false;
+  try {
+    await page.getByRole("button", { name: "Start", exact: true }).click();
+    started = true;
+    await expect(page.getByRole("status")).toContainText("Listening", { timeout: 45_000 });
+    const fixture = await readFile(new URL("../fixtures/jfk.wav", import.meta.url));
+    expect(fixture.byteLength).toBe(352_078);
+    await page.evaluate(async (base64) => {
+      const bridge = (window as Window & {
+        __realBridgeE2e: { pushFixture(base64: string): Promise<void> };
+      }).__realBridgeE2e;
+      await bridge.pushFixture(base64);
+    }, fixture.toString("base64"));
+
+    await expect.poll(async () => {
+      const text = await page.locator(".transcript").innerText();
+      return text.toLowerCase().replace(/[^a-z]+/g, " ");
+    }, { timeout: 100_000 }).toContain("my fellow americans");
+
+    await page.getByRole("button", { name: "Stop" }).click();
+    await expect(page.getByRole("status")).toContainText("Standby", { timeout: 20_000 });
+    started = false;
+  } finally {
+    if (started && await page.getByRole("button", { name: "Stop" }).isEnabled()) {
+      await page.getByRole("button", { name: "Stop" }).click();
+    }
+  }
 });

@@ -7,10 +7,10 @@ import { LOCAL_MODEL } from "../modelManifest.js";
 // behind a same-shaped local copy.
 const VAD_MEMFS_PATH = "/silero.bin";
 function threadCount() {
-    const cores = typeof navigator === "undefined" ? 4 : (navigator.hardwareConcurrency ?? 4);
-    // Matches PTHREAD_POOL_SIZE in native/CMakeLists.txt; asking for more threads
-    // than the pool has just blocks.
-    return Math.max(1, Math.min(4, cores));
+    // The bridge already runs off the UI thread. With the current Emscripten
+    // pthread build, nested workers stall inside whisper_full() after VAD flush
+    // in Chromium; single-thread inference completes the same real WASM path.
+    return 1;
 }
 export function createBridgeRuntime() {
     let module;
