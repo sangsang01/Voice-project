@@ -1,4 +1,4 @@
-import type { EngineEvent, EngineInspection, PcmFrame, SessionRequest, TranscriptionEngine, TranscriptionSession } from "@voice/transcription-contracts";
+import type { EngineEvent, PcmFrame, SessionRequest, TranscriptionEngine, TranscriptionSession } from "@voice/transcription-contracts";
 import { LocalWhisperEngine } from "@voice/local-whisper-engine";
 import type { MicrophoneCapture } from "./audio/microphone";
 import { startMicrophoneCapture } from "./audio/microphone";
@@ -6,12 +6,14 @@ import type { SessionAction } from "./sessionReducer";
 
 export interface MicrophoneStartOptions { onFrame(frame: PcmFrame): void; signal: AbortSignal; }
 export type MicrophoneFactory = (options: MicrophoneStartOptions) => Promise<MicrophoneCapture>;
-export type EngineFactory = () => TranscriptionEngine;
+export interface EngineFactoryOptions { onProgress?(progress: number): void; }
+export type EngineFactory = (options?: EngineFactoryOptions) => TranscriptionEngine;
 
 export interface SessionControllerOptions {
   dispatch(action: SessionAction): void;
   engineFactory?: EngineFactory;
   microphoneFactory?: MicrophoneFactory;
+  onProgress?(progress: number): void;
   onLocalError?(message: string): void;
   onBackpressureWarning?(message: string): void;
 }
@@ -24,7 +26,23 @@ interface ActiveSession {
   microphone?: MicrophoneCapture;
   unsubscribe?: () => void;
   readonly queuedFrames: PcmFrame[];
+  release?: Promise<void>;
 }
+
+interface StartAttempt {
+  readonly sessionId: string;
+  readonly cancelled: Promise<void>;
+  cancel(): void;
+  engine?: TranscriptionEngine;
+  ownsPrivateEngine: boolean;
+  publishedEngine: boolean;
+  disposal?: Promise<void>;
+}
+
+type AttemptResult<T> =
+  | { type: "value"; value: T }
+  | { type: "error"; error: unknown }
+  | { type: "cancelled" };
 
 const AUDIO = { encoding: "pcm_s16le", sampleRateHz: 16000, channels: 1, frameDurationMs: 20 } as const;
 
@@ -32,147 +50,235 @@ export class SessionController {
   private readonly dispatch: (action: SessionAction) => void;
   private readonly engineFactory: EngineFactory;
   private readonly microphoneFactory: MicrophoneFactory;
+  private readonly onProgress: (progress: number) => void;
   private readonly onLocalError: (message: string) => void;
   private readonly onBackpressureWarning: (message: string) => void;
   private active: ActiveSession | undefined;
-  // Published only after a current start safely opens a session. Once published it
-  // is kept across stop/start cycles, so an already prepared model is reused rather
-  // than loaded from scratch for every recording. Pending attempts keep their engine
-  // private because LocalWhisperEngine.prepare() cannot safely run concurrently.
+  // Only a successfully opened, current engine becomes the reusable cache. Engines
+  // that are still inspecting/preparing belong solely to their start attempt.
   private engine: TranscriptionEngine | undefined;
-  // Bumped by stop()/clear() so a startWithId() call already in flight (e.g. still
-  // downloading the model) can detect it was cancelled and discard its result
-  // instead of silently becoming the active session after the user gave up on it.
-  private startToken = 0;
+  private currentAttempt: StartAttempt | undefined;
+  private releasing: Promise<void> | undefined;
+  private disposal: Promise<void> | undefined;
+  private disposed = false;
 
   public constructor(options: SessionControllerOptions) {
     this.dispatch = options.dispatch;
-    this.engineFactory = options.engineFactory ?? (() => new LocalWhisperEngine());
+    this.engineFactory = options.engineFactory ?? ((engineOptions) => new LocalWhisperEngine(engineOptions));
     this.microphoneFactory = options.microphoneFactory ?? startMicrophoneCapture;
+    this.onProgress = options.onProgress ?? (() => undefined);
     this.onLocalError = options.onLocalError ?? (() => undefined);
     this.onBackpressureWarning = options.onBackpressureWarning ?? (() => undefined);
   }
 
   public async start(candidateLanguages: readonly string[]): Promise<string> {
-    return this.startWithId(candidateLanguages, crypto.randomUUID());
+    return this.beginStart(candidateLanguages, crypto.randomUUID());
   }
 
   public async stop(): Promise<void> {
-    this.startToken += 1;
+    this.cancelCurrentAttempt();
     const active = this.active;
-    if (!active) return;
-    try { await active.session.stop(); }
-    finally {
+    if (!active) {
+      await this.releasing;
+      return;
+    }
+    try {
+      await active.session.stop();
+    } finally {
       if (this.active === active) this.active = undefined;
       await this.release(active, false);
     }
   }
 
   public async clearAndRestart(candidateLanguages: readonly string[]): Promise<string> {
-    const nextSessionId = crypto.randomUUID();
-    await this.clear(nextSessionId);
-    return this.startWithId(candidateLanguages, nextSessionId);
+    return this.beginStart(candidateLanguages, crypto.randomUUID());
   }
 
   public async clear(nextSessionId: string = crypto.randomUUID()): Promise<void> {
-    this.startToken += 1;
-    const active = this.active;
-    // Invalidate before cancellation so late engine events cannot re-populate the cleared transcript.
-    this.active = undefined;
-    this.dispatch({ type: "clear", nextSessionId });
-    if (active) await this.release(active, true);
+    this.cancelCurrentAttempt();
+    await this.clearActive(nextSessionId);
   }
 
-  public async dispose(): Promise<void> {
-    await this.clear();
-    await this.dropEngine();
+  public dispose(): Promise<void> {
+    if (this.disposal) return this.disposal;
+    this.disposed = true;
+    const attempt = this.cancelCurrentAttempt();
+    this.disposal = (async () => {
+      try {
+        await this.clearActive();
+      } finally {
+        await this.disposePrivateEngine(attempt);
+        await this.dropEngine();
+      }
+    })();
+    return this.disposal;
   }
 
-  private async dropEngine(): Promise<void> {
-    const engine = this.engine;
-    if (!engine) return;
-    this.engine = undefined;
-    await engine.dispose();
-  }
-
-  private async startWithId(candidateLanguages: readonly string[], sessionId: string): Promise<string> {
-    await this.clear(sessionId);
-    const token = ++this.startToken;
-    const request: SessionRequest = { sessionId, candidateLanguages: candidateLanguages as SessionRequest["candidateLanguages"], mode: "transcribe", audio: AUDIO };
-    const cachedEngine = this.engine;
-    const engine = cachedEngine ?? this.engineFactory();
-    const ownsPrivateEngine = cachedEngine === undefined;
-    let publishedEngine = cachedEngine !== undefined;
-    const abortController = new AbortController();
-    let active: ActiveSession | undefined;
-    const discardPrivateEngine = async () => {
-      if (ownsPrivateEngine && !publishedEngine) await engine.dispose();
-    };
+  private async beginStart(candidateLanguages: readonly string[], sessionId: string): Promise<string> {
+    if (this.disposed) return sessionId;
+    // Reserve before releasing the old session: a Stop/Dispose while release is
+    // pending must cancel this replacement instead of letting it start afterward.
+    const attempt = this.reserveAttempt(sessionId);
     try {
-      const inspection: EngineInspection = await engine.inspect();
-      if (token !== this.startToken) {
-        await discardPrivateEngine();
-        return sessionId;
-      }
-      if (!inspection.available) throw new Error(inspection.reason ?? "Local transcription is unavailable");
-      await engine.prepare(request);
-      if (token !== this.startToken) {
-        await discardPrivateEngine();
-        return sessionId;
-      }
-      const session = await engine.open(request);
-      if (token !== this.startToken) {
-        abortController.abort();
-        await session.cancel().catch(() => undefined);
-        await discardPrivateEngine();
-        return sessionId;
-      }
-      this.engine = engine;
-      publishedEngine = true;
-      active = { id: sessionId, engine, session, abortController, queuedFrames: [] };
-      this.active = active;
-      active.unsubscribe = session.subscribe((event) => this.handleEvent(active!, event));
-      active.microphone = await this.microphoneFactory({ signal: abortController.signal, onFrame: (frame) => this.pushFrame(active!, frame) });
-      if (token !== this.startToken) {
-        if (this.active === active) {
-          this.active = undefined;
-          await this.release(active, true);
-        } else {
-          await active.microphone?.stop();
-          active.unsubscribe?.();
-        }
-        return sessionId;
-      }
-      return sessionId;
+      await this.awaitAttempt(attempt, this.clearActive(sessionId));
     } catch (error) {
-      if (token !== this.startToken) {
-        abortController.abort();
-        if (active) {
-          if (this.active === active) {
-            this.active = undefined;
-            await this.release(active, true);
-          } else {
-            await active.microphone?.stop();
-            active.unsubscribe?.();
-          }
-        }
-        await discardPrivateEngine();
-        return sessionId;
-      }
-      if (this.active === active) this.active = undefined;
-      this.onLocalError(error instanceof Error ? error.message : "Local transcription is unavailable");
-      abortController.abort();
-      if (active) {
-        // engine.open() already succeeded and only the microphone failed afterward --
-        // the engine itself is presumably fine, so keep it cached for the next start().
-        await this.release(active, true);
-      } else {
-        // prepare()/open() itself failed -- the engine may be broken, don't cache it.
-        if (this.engine === engine) this.engine = undefined;
-        await engine.dispose();
-      }
+      if (!this.isCurrent(attempt)) return sessionId;
+      this.failAttempt(attempt, error);
       throw error;
     }
+    if (!this.isCurrent(attempt)) return sessionId;
+    return this.runAttempt(attempt, candidateLanguages);
+  }
+
+  private async runAttempt(attempt: StartAttempt, candidateLanguages: readonly string[]): Promise<string> {
+    if (!this.isCurrent(attempt)) return attempt.sessionId;
+    const request: SessionRequest = {
+      sessionId: attempt.sessionId,
+      candidateLanguages: candidateLanguages as SessionRequest["candidateLanguages"],
+      mode: "transcribe",
+      audio: AUDIO,
+    };
+    const cachedEngine = this.engine;
+    let engine = cachedEngine;
+    if (!engine) {
+      const progressSource: { engine?: TranscriptionEngine } = {};
+      engine = this.engineFactory({
+        onProgress: (progress) => {
+          if (progressSource.engine) this.reportProgress(progressSource.engine, progress);
+        },
+      });
+      progressSource.engine = engine;
+    }
+    attempt.engine = engine;
+    attempt.ownsPrivateEngine = cachedEngine === undefined;
+    attempt.publishedEngine = cachedEngine !== undefined;
+    const abortController = new AbortController();
+    let active: ActiveSession | undefined;
+
+    try {
+      const inspection = await this.awaitAttempt(attempt, Promise.resolve(engine.inspect()));
+      if (!this.isCurrent(attempt) || inspection === undefined) return attempt.sessionId;
+      if (!inspection.available) throw new Error(inspection.reason ?? "Local transcription is unavailable");
+
+      await this.awaitAttempt(attempt, Promise.resolve(engine.prepare(request)));
+      if (!this.isCurrent(attempt)) return attempt.sessionId;
+
+      const opening = Promise.resolve(engine.open(request));
+      void opening.then(
+        (session) => { if (!this.isCurrent(attempt)) void session.cancel().catch(() => undefined); },
+        () => undefined,
+      );
+      const session = await this.awaitAttempt(attempt, opening);
+      if (!this.isCurrent(attempt) || session === undefined) {
+        abortController.abort();
+        return attempt.sessionId;
+      }
+
+      // An opened session proves this engine is usable and can now be cached. This
+      // assignment is guarded by isCurrent above, so a stale attempt cannot publish.
+      this.engine = engine;
+      attempt.publishedEngine = true;
+      active = { id: attempt.sessionId, engine, session, abortController, queuedFrames: [] };
+      this.active = active;
+      active.unsubscribe = session.subscribe((event) => this.handleEvent(active!, event));
+
+      const startingMicrophone = Promise.resolve(this.microphoneFactory({
+        signal: abortController.signal,
+        onFrame: (frame) => this.pushFrame(active!, frame),
+      }));
+      void startingMicrophone.then(
+        (capture) => { if (!this.isCurrent(attempt)) void capture.stop().catch(() => undefined); },
+        () => undefined,
+      );
+      const microphone = await this.awaitAttempt(attempt, startingMicrophone);
+      if (!this.isCurrent(attempt)) return attempt.sessionId;
+      active.microphone = microphone;
+      this.finishAttempt(attempt);
+      return attempt.sessionId;
+    } catch (error) {
+      if (!this.isCurrent(attempt)) return attempt.sessionId;
+      abortController.abort();
+      let failure = error;
+      if (active && this.active === active) {
+        this.active = undefined;
+        try { await this.release(active, true); }
+        catch (cleanupError) { failure = cleanupError; }
+      } else if (this.engine === engine) {
+        // A previously cached engine that now fails inspection, preparation, or
+        // open is no longer usable; evict only this exact current cache entry.
+        try { await this.dropEngine(); }
+        catch (cleanupError) { failure = cleanupError; }
+      }
+      if (!this.isCurrent(attempt)) return attempt.sessionId;
+      this.failAttempt(attempt, failure);
+      throw failure;
+    } finally {
+      if (!this.isCurrent(attempt)) void this.disposePrivateEngine(attempt);
+    }
+  }
+
+  private reserveAttempt(sessionId: string): StartAttempt {
+    this.cancelCurrentAttempt();
+    let resolveCancelled: () => void = () => undefined;
+    const attempt: StartAttempt = {
+      sessionId,
+      cancelled: new Promise<void>((resolve) => { resolveCancelled = resolve; }),
+      cancel: () => resolveCancelled(),
+      ownsPrivateEngine: false,
+      publishedEngine: false,
+    };
+    this.currentAttempt = attempt;
+    return attempt;
+  }
+
+  private cancelCurrentAttempt(): StartAttempt | undefined {
+    const attempt = this.currentAttempt;
+    if (!attempt) return undefined;
+    this.currentAttempt = undefined;
+    attempt.cancel();
+    void this.disposePrivateEngine(attempt);
+    return attempt;
+  }
+
+  private finishAttempt(attempt: StartAttempt): void {
+    if (this.currentAttempt === attempt) this.currentAttempt = undefined;
+  }
+
+  private isCurrent(attempt: StartAttempt): boolean {
+    return !this.disposed && this.currentAttempt === attempt;
+  }
+
+  // Every operation is observed through both resolve and reject handlers. If
+  // cancellation wins the race, a later rejection remains handled rather than
+  // becoming an unhandled promise rejection.
+  private async awaitAttempt<T>(attempt: StartAttempt, operation: Promise<T>): Promise<T | undefined> {
+    const result = await Promise.race<AttemptResult<T>>([
+      operation.then(
+        (value) => ({ type: "value", value } as AttemptResult<T>),
+        (error) => ({ type: "error", error } as AttemptResult<T>),
+      ),
+      attempt.cancelled.then(() => ({ type: "cancelled" } as AttemptResult<T>)),
+    ]);
+    if (result.type === "cancelled") return undefined;
+    if (result.type === "error") throw result.error;
+    return result.value;
+  }
+
+  private disposePrivateEngine(attempt: StartAttempt | undefined): Promise<void> | undefined {
+    if (!attempt || !attempt.ownsPrivateEngine || attempt.publishedEngine || !attempt.engine) return undefined;
+    attempt.disposal ??= attempt.engine.dispose().catch(() => undefined);
+    return attempt.disposal;
+  }
+
+  private reportProgress(engine: TranscriptionEngine, progress: number): void {
+    const attempt = this.currentAttempt;
+    if (attempt?.engine === engine && this.isCurrent(attempt)) this.onProgress(progress);
+  }
+
+  private failAttempt(attempt: StartAttempt, error: unknown): void {
+    if (this.currentAttempt === attempt) this.currentAttempt = undefined;
+    void this.disposePrivateEngine(attempt);
+    this.onLocalError(error instanceof Error ? error.message : "Local transcription is unavailable");
   }
 
   private handleEvent(active: ActiveSession, event: EngineEvent): void {
@@ -191,16 +297,39 @@ export class SessionController {
     }
   }
 
-  // Tears down the session (mic, subscription, socket/worker session) but deliberately
-  // leaves the engine itself alone -- it's cached on `this.engine` for reuse by the next
-  // start() so a prepared model doesn't reload on every single recording.
-  private async release(active: ActiveSession, cancel: boolean): Promise<void> {
-    try {
-      active.abortController.abort();
-      if (cancel) await active.session.cancel();
-    } finally {
-      try { await active.microphone?.stop(); }
-      finally { active.unsubscribe?.(); }
+  private async clearActive(nextSessionId: string = crypto.randomUUID()): Promise<void> {
+    const active = this.active;
+    this.active = undefined;
+    this.dispatch({ type: "clear", nextSessionId });
+    if (active) await this.release(active, true);
+    else await this.releasing;
+  }
+
+  private async dropEngine(): Promise<void> {
+    const engine = this.engine;
+    if (!engine) return;
+    this.engine = undefined;
+    await engine.dispose();
+  }
+
+  // Teardown is shared by concurrent stop/clear/dispose calls. The first caller's
+  // cancellation mode wins, and every caller awaits the same cleanup promise.
+  private release(active: ActiveSession, cancel: boolean): Promise<void> {
+    if (!active.release) {
+      const releasing = (async () => {
+        try {
+          active.abortController.abort();
+          if (cancel) await active.session.cancel();
+        } finally {
+          try { await active.microphone?.stop(); }
+          finally { active.unsubscribe?.(); }
+        }
+      })();
+      active.release = releasing.finally(() => {
+        if (this.releasing === active.release) this.releasing = undefined;
+      });
+      this.releasing = active.release;
     }
+    return active.release;
   }
 }

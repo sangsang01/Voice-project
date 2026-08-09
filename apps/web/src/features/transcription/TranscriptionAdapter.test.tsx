@@ -13,6 +13,7 @@ import { describe, expect, it, vi } from "vitest";
 const defaultLocalEngine = vi.hoisted(() => ({
   created: 0,
   onProgress: undefined as ((progress: number) => void) | undefined,
+  onProgressCallbacks: [] as Array<((progress: number) => void) | undefined>,
   inspect: vi.fn(async () => ({ available: true })),
   prepare: vi.fn(async () => undefined),
   open: vi.fn(),
@@ -29,6 +30,7 @@ vi.mock("@voice/local-whisper-engine", () => ({
     public constructor(options: { onProgress?: (progress: number) => void } = {}) {
       defaultLocalEngine.created += 1;
       defaultLocalEngine.onProgress = options.onProgress;
+      defaultLocalEngine.onProgressCallbacks.push(options.onProgress);
     }
   },
 }));
@@ -212,6 +214,29 @@ describe("TranscriptionAdapter", () => {
       expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
       expect(screen.getByText("Preparing local model 42%")).toBeVisible();
     });
+  });
+
+  it("ignores progress emitted by a superseded local engine", async () => {
+    defaultLocalEngine.created = 0;
+    defaultLocalEngine.onProgressCallbacks = [];
+    defaultLocalEngine.inspect.mockReset();
+    defaultLocalEngine.prepare.mockReset();
+    defaultLocalEngine.open.mockReset();
+    defaultLocalEngine.dispose.mockReset();
+    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
+    defaultLocalEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Clear & Restart" }));
+    await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(2));
+    expect(defaultLocalEngine.onProgressCallbacks).toHaveLength(2);
+
+    act(() => defaultLocalEngine.onProgressCallbacks[1]?.(0.42));
+    expect(await screen.findByText("Preparing local model 42%")).toBeVisible();
+    act(() => defaultLocalEngine.onProgressCallbacks[0]?.(0.9));
+    expect(screen.getByText("Preparing local model 42%")).toBeVisible();
   });
 
   it("surfaces unsupported local capabilities without preparing or opening an engine", async () => {

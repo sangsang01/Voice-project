@@ -1,6 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { EarthGlobe } from "../../components/EarthGlobe";
-import { LocalWhisperEngine } from "@voice/local-whisper-engine";
 import { SessionController, type EngineFactory, type MicrophoneFactory } from "./sessionController";
 import { createSessionState, sessionReducer } from "./sessionReducer";
 
@@ -30,8 +29,9 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
   // Disposal still needs an effect, since that's a side effect on unmount.
   const [controller] = useState<SessionController>(() => new SessionController({
     dispatch,
-    engineFactory: engineFactory ?? (() => new LocalWhisperEngine({ onProgress: setLoadProgress })),
+    engineFactory,
     microphoneFactory,
+    onProgress: setLoadProgress,
     onLocalError: setLocalError,
     onBackpressureWarning: setBackpressureWarning,
   }));
