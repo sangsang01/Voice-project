@@ -51,6 +51,6 @@ describeEngineContract("local whisper", () => new LocalWhisperEngine({ workerFac
 // test/workerController.test.ts, written against the new VAD-gated session
 // loop. The fixed-window-batching tests that used to live here (device
 // selection, windowFrames-based draining, per-window revisions, transcribe
-// timeouts) tested the old transformers.js fixed-window runtime this file
+// timeouts) tested the old fixed-window runtime this file
 // replaced and no longer apply -- there is no more "window", no per-window
 // revision bump, and no transcribeTimeoutMs option.
