@@ -10,7 +10,8 @@ import type {
 } from "@voice/transcription-contracts";
 import { validatePcmFrame, validateSessionRequest } from "@voice/transcription-contracts";
 
-import type { InferenceDevice, MainToWorker, WorkerEvent } from "./worker/protocol.js";
+import { inspectLocalCapabilities } from "./browser/capabilities.js";
+import type { MainToWorker, WorkerEvent } from "./worker/protocol.js";
 
 export interface WorkerLike {
   onmessage: ((event: MessageEvent<WorkerEvent>) => void) | null;
@@ -20,7 +21,6 @@ export interface WorkerLike {
 }
 
 export interface LocalWhisperEngineOptions {
-  device?: InferenceDevice;
   maxBufferedFrames?: number;
   onProgress?: (progress: number) => void;
   workerFactory?: () => WorkerLike;
@@ -130,15 +130,16 @@ export class LocalWhisperEngine implements TranscriptionEngine {
   public constructor(private readonly options: LocalWhisperEngineOptions = {}) {}
 
   public async inspect(): Promise<EngineInspection> {
-    return this.disposed ? { available: false, reason: "disposed" } : { available: true };
+    if (this.disposed) return { available: false, reason: "disposed" };
+    const capabilities = inspectLocalCapabilities();
+    return capabilities.supported ? { available: true } : { available: false, reason: capabilities.reason };
   }
 
   public async prepare(request: SessionRequest): Promise<void> {
     this.assertAvailable();
     validateSessionRequest(request);
     if (this.prepared) return;
-    const preferred = this.options.device ?? "webgpu";
-    await this.prepareDevice(preferred, preferred === "webgpu");
+    await this.startWorker();
     this.prepared = true;
   }
 
@@ -147,9 +148,9 @@ export class LocalWhisperEngine implements TranscriptionEngine {
     const valid = validateSessionRequest(request);
     if (!this.prepared || !this.worker) throw new Error("engine must be prepared before opening a session");
     if (this.activeSession && !this.activeSession.isTerminal) throw new Error("an active local Whisper session already exists");
-    // Mirrors the worker's own default (see localWhisper.worker.ts) so the main-thread
-    // flow-control cap doesn't trip before the worker's first transcription window fills.
-    const session = new LocalSession(valid, this.worker, this.options.maxBufferedFrames ?? 800);
+    // Mirrors the worker's own cap (see localWhisper.worker.ts): ~60s of audio at
+    // 20ms per frame, which is well above the 25s longest possible utterance.
+    const session = new LocalSession(valid, this.worker, this.options.maxBufferedFrames ?? 3000);
     this.activeSession = session;
     this.worker.postMessage({ type: "open", request: valid });
     return session;
@@ -164,7 +165,7 @@ export class LocalWhisperEngine implements TranscriptionEngine {
     this.worker = undefined;
   }
 
-  private async prepareDevice(device: InferenceDevice, canFallback: boolean): Promise<void> {
+  private async startWorker(): Promise<void> {
     this.worker?.terminate();
     const worker = (this.options.workerFactory ?? defaultWorkerFactory)();
     this.worker = worker;
@@ -198,10 +199,7 @@ export class LocalWhisperEngine implements TranscriptionEngine {
         this.activeSession?.fail("local Whisper worker failed");
         this.activeSession = undefined;
       };
-      worker.postMessage({ type: "prepare", requestId, device });
-    }).catch(async (error) => {
-      if (!canFallback) throw error;
-      await this.prepareDevice("wasm", false);
+      worker.postMessage({ type: "prepare", requestId });
     });
   }
 

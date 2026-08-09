@@ -32,33 +32,70 @@ function flush(): Promise<void> {
 }
 
 describe("LocalWhisperEngine", () => {
-  it("relays preparation progress and retries a WebGPU load exactly once with WASM", async () => {
-    const workers: FakeWorker[] = [];
+  it("relays preparation progress through the single local backend", async () => {
+    const worker = new FakeWorker();
     const progress: number[] = [];
     const engine = new LocalWhisperEngine({
-      device: "webgpu",
       onProgress: (value) => progress.push(value),
-      workerFactory: () => {
-        const worker = new FakeWorker();
-        workers.push(worker);
-        return worker;
-      },
+      workerFactory: () => worker,
     });
     const request = makeSessionRequest(["en-US"]);
 
     const preparing = engine.prepare(request);
-    workers[0]!.emit({ type: "progress", requestId: 1, progress: 0.25 });
-    workers[0]!.emit({ type: "prepare.error", requestId: 1, device: "webgpu", message: "GPU lost" });
-    await flush();
-    workers[1]!.emit({ type: "progress", requestId: 2, progress: 1 });
-    workers[1]!.emit({ type: "prepared", requestId: 2, device: "wasm" });
+    worker.emit({ type: "progress", requestId: 1, progress: 0.25 });
+    worker.emit({ type: "progress", requestId: 1, progress: 1 });
+    worker.emit({ type: "prepared", requestId: 1 });
     await preparing;
 
     expect(progress).toEqual([0.25, 1]);
-    expect(workers).toHaveLength(2);
-    expect(workers[0]!.terminated).toBe(true);
-    expect(workers[0]!.sent).toEqual([expect.objectContaining({ type: "prepare", device: "webgpu" })]);
-    expect(workers[1]!.sent).toEqual([expect.objectContaining({ type: "prepare", device: "wasm" })]);
+    expect(worker.sent).toEqual([{ type: "prepare", requestId: 1 }]);
+  });
+
+  it("reports why local transcription is unavailable when the host is not isolated", async () => {
+    const engine = new LocalWhisperEngine({ workerFactory: () => { throw new Error("should not construct"); } });
+    const original = Object.getOwnPropertyDescriptor(globalThis, "crossOriginIsolated");
+    Object.defineProperty(globalThis, "crossOriginIsolated", { configurable: true, value: false });
+    try {
+      const inspection = await engine.inspect();
+      expect(inspection.available).toBe(false);
+      expect(inspection.reason).toMatch(/cross-origin isolation/i);
+    } finally {
+      if (original) Object.defineProperty(globalThis, "crossOriginIsolated", original);
+      else Reflect.deleteProperty(globalThis, "crossOriginIsolated");
+    }
+  });
+
+  it("rejects a preparation error without constructing a fallback worker", async () => {
+    const workers: FakeWorker[] = [];
+    const engine = new LocalWhisperEngine({ workerFactory: () => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    } });
+
+    const preparing = engine.prepare(makeSessionRequest(["en-US"]));
+    const rejects = expect(preparing).rejects.toThrow("load failed");
+    workers[0]!.emit({ type: "prepare.error", requestId: 1, message: "load failed" });
+    await flush();
+    workers[1]?.emit({ type: "prepared", requestId: 2 });
+
+    await rejects;
+    expect(workers).toHaveLength(1);
+  });
+
+  it("matches the worker's 3000-frame buffer cap by default", async () => {
+    const worker = new FakeWorker();
+    const engine = new LocalWhisperEngine({ workerFactory: () => worker });
+    const request = makeSessionRequest(["en-US"]);
+    const preparing = engine.prepare(request);
+    worker.emit({ type: "prepared", requestId: 1 });
+    await preparing;
+    const session = await engine.open(request);
+
+    for (let sequence = 0; sequence < 3000; sequence += 1) {
+      expect(session.push(makePcmFrame(sequence))).toEqual({ accepted: true });
+    }
+    expect(session.push(makePcmFrame(3000))).toEqual({ accepted: false, reason: "backpressure" });
   });
 
   it("orders transferred frames, applies bounded backpressure, and drains to a final stable segment", async () => {
@@ -66,7 +103,7 @@ describe("LocalWhisperEngine", () => {
     const engine = new LocalWhisperEngine({ workerFactory: () => worker, maxBufferedFrames: 2 });
     const request = makeSessionRequest(["en-US"]);
     const preparing = engine.prepare(request);
-    worker.emit({ type: "prepared", requestId: 1, device: "webgpu" });
+    worker.emit({ type: "prepared", requestId: 1 });
     await preparing;
     const session = await engine.open(request);
     const events: unknown[] = [];
@@ -98,7 +135,7 @@ describe("LocalWhisperEngine", () => {
     const engine = new LocalWhisperEngine({ workerFactory: () => worker });
     const request = makeSessionRequest(["en-US"]);
     const preparing = engine.prepare(request);
-    worker.emit({ type: "prepared", requestId: 1, device: "webgpu" });
+    worker.emit({ type: "prepared", requestId: 1 });
     await preparing;
     const session = await engine.open(request);
     const events: unknown[] = [];
@@ -121,7 +158,7 @@ describe("LocalWhisperEngine", () => {
     const engine = new LocalWhisperEngine({ workerFactory: () => worker, maxBufferedFrames: 2 });
     const request = makeSessionRequest(["en-US"]);
     const preparing = engine.prepare(request);
-    worker.emit({ type: "prepared", requestId: 1, device: "webgpu" });
+    worker.emit({ type: "prepared", requestId: 1 });
     await preparing;
     const session = await engine.open(request);
 
@@ -139,7 +176,7 @@ describe("LocalWhisperEngine", () => {
     const engine = new LocalWhisperEngine({ workerFactory: () => worker });
     const request = makeSessionRequest(["en-US"]);
     const preparing = engine.prepare(request);
-    worker.emit({ type: "prepared", requestId: 1, device: "webgpu" });
+    worker.emit({ type: "prepared", requestId: 1 });
     await preparing;
     const session = await engine.open(request);
     const events: unknown[] = [];
@@ -162,7 +199,7 @@ describe("LocalWhisperEngine", () => {
     const engine = new LocalWhisperEngine({ workerFactory: () => worker });
     const firstRequest = makeSessionRequest(["en-US"]);
     const preparing = engine.prepare(firstRequest);
-    worker.emit({ type: "prepared", requestId: 1, device: "webgpu" });
+    worker.emit({ type: "prepared", requestId: 1 });
     await preparing;
     const first = await engine.open(firstRequest);
 
@@ -182,7 +219,7 @@ describe("LocalWhisperEngine", () => {
     } });
     const request = makeSessionRequest(["en-US"]);
     const preparing = engine.prepare(request);
-    workers[0]!.emit({ type: "prepared", requestId: 1, device: "webgpu" });
+    workers[0]!.emit({ type: "prepared", requestId: 1 });
     await preparing;
     workers[0]!.crash();
 
@@ -190,7 +227,7 @@ describe("LocalWhisperEngine", () => {
     await expect(engine.open(request)).rejects.toThrow("prepared");
     const reprepare = engine.prepare(request);
     expect(workers).toHaveLength(2);
-    workers[1]!.emit({ type: "prepared", requestId: 2, device: "webgpu" });
+    workers[1]!.emit({ type: "prepared", requestId: 2 });
     await reprepare;
     await expect(engine.open(request)).resolves.toBeDefined();
   });
@@ -200,7 +237,7 @@ describe("LocalWhisperEngine", () => {
     const engine = new LocalWhisperEngine({ workerFactory: () => worker, maxBufferedFrames: 2 });
     const firstRequest = makeSessionRequest(["en-US"]);
     const preparing = engine.prepare(firstRequest);
-    worker.emit({ type: "prepared", requestId: 1, device: "webgpu" });
+    worker.emit({ type: "prepared", requestId: 1 });
     await preparing;
     const first = await engine.open(firstRequest);
     expect(first.push(makePcmFrame(0))).toEqual({ accepted: true });
