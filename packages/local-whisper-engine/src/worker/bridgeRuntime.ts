@@ -19,6 +19,8 @@ export interface WhisperRuntime {
   load(options: { onProgress(fraction: number): void }, signal: AbortSignal): Promise<void>;
   /** One probability per 512-sample window; Silero state persists across calls. */
   vadProbs(samples: Float32Array): Float32Array;
+  /** Starts a new utterance with a clean Silero recurrent state. */
+  vadReset(): void;
   transcribe(samples: Float32Array, signal: AbortSignal): Promise<TranscribeResult>;
   dispose(): Promise<void>;
 }
@@ -133,6 +135,11 @@ export function createBridgeRuntime(): WhisperRuntime {
       // point at freed/reused memory) the moment the next chunk arrives.
       // Same byte-offset -> float-index conversion as writeSamples() above.
       return module.HEAPF32.slice(probsPtr >> 2, (probsPtr >> 2) + count);
+    },
+
+    vadReset() {
+      if (!bridge) throw new Error("whisper bridge is not loaded");
+      bridge.vadReset();
     },
 
     async transcribe(samples, signal) {

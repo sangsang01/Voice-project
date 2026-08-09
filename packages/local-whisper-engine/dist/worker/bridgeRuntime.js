@@ -108,6 +108,11 @@ export function createBridgeRuntime() {
             // Same byte-offset -> float-index conversion as writeSamples() above.
             return module.HEAPF32.slice(probsPtr >> 2, (probsPtr >> 2) + count);
         },
+        vadReset() {
+            if (!bridge)
+                throw new Error("whisper bridge is not loaded");
+            bridge.vadReset();
+        },
         async transcribe(samples, signal) {
             if (!module || !bridge)
                 throw new Error("whisper bridge is not loaded");

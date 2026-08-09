@@ -27,6 +27,7 @@ class RuntimeWorker implements WorkerLike {
 function runtime(): WhisperRuntime {
   return {
     load: async ({ onProgress }) => onProgress(1),
+    vadReset: () => undefined,
     vadProbs: (samples) => new Float32Array(Math.floor(samples.length / 512)).fill(0.9),
     transcribe: async () => ({ text: "hello", language: "en", languageProbability: 1 }),
     dispose: async () => undefined,

@@ -21,10 +21,13 @@ function frame(sequence: number): PcmFrame {
 function fakeRuntime(overrides: Partial<WhisperRuntime> = {}) {
   let windowsSeen = 0;
   const speechWindows = Math.ceil((VAD_DEFAULTS.minSpeechMs + 100) / VAD_DEFAULTS.windowMs);
+  const vadReset = vi.fn();
   return {
     transcribeCalls: [] as Float32Array[],
+    vadReset,
     runtime: {
       load: async ({ onProgress }) => onProgress(1),
+      vadReset,
       vadProbs: (samples: Float32Array) => {
         const count = Math.floor(samples.length / 512);
         const probs = new Float32Array(count);
@@ -79,6 +82,157 @@ async function pushUtterances(
 }
 
 describe("worker controller", () => {
+  it("resets native VAD before opening and after a silence-finalized utterance", async () => {
+    const { post } = collect();
+    const calls: string[] = [];
+    const { runtime, vadReset } = fakeRuntime({
+      vadProbs: (samples) => {
+        calls.push("vad");
+        return new Float32Array(Math.floor(samples.length / 512)).fill(calls.filter((call) => call === "vad").length <= 10 ? 0.9 : 0.1);
+      },
+      transcribe: async () => {
+        calls.push("transcribe");
+        return { text: "utterance", language: "en", languageProbability: 1 };
+      },
+    });
+    vadReset.mockImplementation(() => calls.push("reset"));
+    const controller = createWorkerController(runtime, post);
+
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 60; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    expect(vadReset).toHaveBeenCalledTimes(2);
+    expect(calls[0]).toBe("reset");
+    const transcribeIndex = calls.indexOf("transcribe");
+    expect(calls[transcribeIndex - 1]).toBe("reset");
+  });
+
+  it("resets once for cancel, stop, and a replacement session", async () => {
+    const { post } = collect();
+    const { runtime, vadReset } = fakeRuntime({
+      vadProbs: (samples) => new Float32Array(Math.floor(samples.length / 512)).fill(0.05),
+    });
+    const controller = createWorkerController(runtime, post);
+
+    await controller.handle({ type: "open", request });
+    await controller.handle({ type: "cancel", sessionId: SESSION });
+    await controller.handle({ type: "open", request: { ...request, sessionId: "session-2" } });
+    await controller.handle({ type: "stop", sessionId: "session-2" });
+    await controller.handle({ type: "open", request: { ...request, sessionId: "session-3" } });
+    await controller.handle({ type: "open", request: { ...request, sessionId: "session-4" } });
+
+    expect(vadReset).toHaveBeenCalledTimes(6);
+  });
+
+  it("fails the matching session when native VAD reset throws", async () => {
+    const { post, events } = collect();
+    const { runtime } = fakeRuntime({ vadReset: () => { throw new Error("VAD reset exploded"); } } as Partial<WhisperRuntime>);
+    const controller = createWorkerController(runtime, post);
+
+    await controller.handle({ type: "open", request });
+
+    expect(engineEvents(events)).toEqual([
+      expect.objectContaining({ type: "error", sessionId: SESSION, code: "INTERNAL", fatal: true, message: "VAD reset exploded" }),
+      expect.objectContaining({ type: "state", sessionId: SESSION, state: "stopped" }),
+    ]);
+  });
+
+  it("fails instead of transcribing when native VAD reset throws at an utterance boundary", async () => {
+    const { post, events } = collect();
+    let resets = 0;
+    const transcribe = vi.fn(async () => ({ text: "must not run", language: "en", languageProbability: 1 }));
+    const { runtime } = fakeRuntime({
+      vadReset: () => {
+        resets += 1;
+        if (resets === 2) throw new Error("boundary reset exploded");
+      },
+      transcribe,
+    });
+    const controller = createWorkerController(runtime, post);
+
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 60; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(engineEvents(events)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "error", sessionId: SESSION, code: "INTERNAL", fatal: true, message: "boundary reset exploded" }),
+      expect.objectContaining({ type: "state", sessionId: SESSION, state: "stopped" }),
+    ]));
+  });
+
+  it("waits for max-duration forward padding and keeps samples aligned with overlapping timestamps", async () => {
+    const { post, events } = collect();
+    const transcriptions: Float32Array[] = [];
+    const order: string[] = [];
+    const vadReset = vi.fn(() => order.push("reset"));
+    const runtime = {
+      load: async ({ onProgress }: { onProgress(n: number): void }) => onProgress(1),
+      vadReset,
+      vadProbs: (samples: Float32Array) => {
+        order.push("vad");
+        return new Float32Array(Math.floor(samples.length / 512)).fill(0.9);
+      },
+      transcribe: async (samples: Float32Array) => {
+        order.push("transcribe");
+        transcriptions.push(samples);
+        return { text: "utterance", language: "en", languageProbability: 1 };
+      },
+      dispose: async () => undefined,
+    } as WhisperRuntime;
+    const controller = createWorkerController(runtime, post);
+
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 2_600; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+
+    const segments = engineEvents(events).flatMap((event) => event.type === "segment.upsert" ? [event.segment] : []);
+    expect(segments).toHaveLength(2);
+    expect(transcriptions).toHaveLength(2);
+    expect(segments.map(({ startMs, endMs }) => ({ startMs, endMs }))).toEqual([
+      { startMs: 0, endMs: 25_124 },
+      { startMs: 24_924, endMs: 50_148 },
+    ]);
+    for (let index = 0; index < segments.length; index += 1) {
+      expect(transcriptions[index]!.length).toBe((segments[index]!.endMs - segments[index]!.startMs) * 16);
+    }
+    expect(segments[0]!.endMs - segments[1]!.startMs).toBe(2 * VAD_DEFAULTS.speechPadMs);
+    expect(vadReset).toHaveBeenCalledTimes(3); // open plus two finalized max-duration boundaries
+    const firstTranscribe = order.indexOf("transcribe");
+    expect(order[firstTranscribe - 1]).toBe("reset");
+    expect(order.slice(firstTranscribe + 1)).toContain("vad");
+
+    const creditedFrames = events.reduce((total, event) => event.type === "credit" ? total + event.frames : total, 0);
+    expect(creditedFrames).toBe(2_497);
+  });
+
+  it("clamps a pending max-duration flush to audio actually available when stopped before forward padding", async () => {
+    const { post, events } = collect();
+    const transcribe = vi.fn(async (samples: Float32Array) => ({ text: String(samples.length), language: "en", languageProbability: 1 }));
+    const { runtime, vadReset } = fakeRuntime({
+      vadProbs: (samples) => new Float32Array(Math.floor(samples.length / 512)).fill(0.9),
+      transcribe,
+    });
+    const controller = createWorkerController(runtime, post);
+
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 1_252; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+    expect(transcribe).not.toHaveBeenCalled();
+    await controller.handle({ type: "stop", sessionId: SESSION });
+
+    const segments = engineEvents(events).flatMap((event) => event.type === "segment.upsert" ? [event.segment] : []);
+    expect(segments).toHaveLength(1);
+    expect(segments[0]).toMatchObject({ startMs: 0, endMs: 25_040 });
+    expect(transcribe.mock.calls[0]![0].length).toBe(25_040 * 16);
+    expect(vadReset).toHaveBeenCalledTimes(2);
+  });
+
   it("emits one final segment per detected utterance", async () => {
     const { post, events } = collect();
     const { runtime } = fakeRuntime();
@@ -103,6 +257,7 @@ describe("worker controller", () => {
     let window = 0;
     const runtime = {
       load: async ({ onProgress }: { onProgress(n: number): void }) => onProgress(1),
+      vadReset: () => undefined,
       vadProbs: (samples: Float32Array) => {
         const count = Math.floor(samples.length / 512);
         const probs = new Float32Array(count);
@@ -164,6 +319,30 @@ describe("worker controller", () => {
     expect(transcribe).toHaveBeenCalled();
     const states = engineEvents(events).filter((event) => event.type === "state");
     expect(states.at(-1)).toMatchObject({ state: "stopped" });
+    expect(events.reduce((total, event) => event.type === "credit" ? total + event.frames : total, 0)).toBe(30);
+  });
+
+  it.each([
+    { label: "silence-only", probability: 0.05 },
+    { label: "sub-minimum speech", probability: 0.9 },
+  ])("releases buffered frames exactly once when stopping $label audio", async ({ probability }) => {
+    const { post, events } = collect();
+    const { runtime, vadReset } = fakeRuntime({
+      vadProbs: (samples) => new Float32Array(Math.floor(samples.length / 512)).fill(probability),
+    });
+    const controller = createWorkerController(runtime, post);
+
+    await controller.handle({ type: "open", request });
+    for (let index = 0; index < 10; index += 1) {
+      await controller.handle({ type: "push", sessionId: SESSION, frame: frame(index) });
+    }
+    await controller.handle({ type: "stop", sessionId: SESSION });
+
+    expect(events.filter((event) => event.type === "credit")).toEqual([
+      { type: "credit", sessionId: SESSION, frames: 10 },
+    ]);
+    expect(vadReset).toHaveBeenCalledTimes(2);
+    expect(engineEvents(events).at(-1)).toMatchObject({ type: "state", state: "stopped" });
   });
 
   it("emits no segment for silence alone", async () => {

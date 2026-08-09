@@ -3,7 +3,7 @@ import type { EngineEvent, PcmFrame, SessionRequest, TranscriptSegment } from "@
 import { mapDetectedLanguage } from "../segmentation/languageMap.js";
 import { createBridgeRuntime, type WhisperRuntime } from "./bridgeRuntime.js";
 import type { MainToWorker, WorkerEvent } from "./protocol.js";
-import { createVadGate, VAD_DEFAULTS, type VadGateConfig } from "./vadGate.js";
+import { createVadGate, VAD_DEFAULTS, type VadDecision, type VadGateConfig } from "./vadGate.js";
 
 export type { WhisperRuntime } from "./bridgeRuntime.js";
 
@@ -23,13 +23,19 @@ interface ActiveSession {
   terminal: boolean;
   /** Whole-session audio, trimmed once an utterance is transcribed. */
   audio: Float32Array[];
-  audioStartMs: number;
+  audioStartSample: number;
+  audioSampleCount: number;
+  discardedCreditSamples: number;
   bufferedFrames: number;
   consecutiveSlowTranscriptions: number;
   gate: ReturnType<typeof createVadGate>;
-  vadCarry: Float32Array;
+  /** Raw audio not yet processed by native VAD. Kept bounded while a max flush awaits forward padding. */
+  vadQueue: Float32Array;
   windowIndex: number;
+  pendingMaxFlush?: FlushDecision;
 }
+
+type FlushDecision = Extract<VadDecision, { type: "flush" }>;
 
 type EventWithoutEnvelope = EngineEvent extends infer Event
   ? Event extends EngineEvent
@@ -37,7 +43,6 @@ type EventWithoutEnvelope = EngineEvent extends infer Event
     : never
   : never;
 
-const FRAME_MS = 20;
 const FRAME_SAMPLES = 320;
 const VAD_WINDOW_SAMPLES = 512;
 const SAMPLE_RATE = 16_000;
@@ -48,6 +53,7 @@ export function createWorkerController(
   options: WorkerControllerOptions = {},
 ) {
   const maxBufferedFrames = options.maxBufferedFrames ?? 3000;
+  const vadConfig = { ...VAD_DEFAULTS, ...options.vad };
   const now = options.now ?? (() => performance.now());
   let loadAbort = new AbortController();
   let active: ActiveSession | undefined;
@@ -85,31 +91,84 @@ export function createWorkerController(
     return merged;
   };
 
+  const sampleToMs = (sample: number) => (sample * 1000) / SAMPLE_RATE;
+  const audioEndSample = (session: ActiveSession) => session.audioStartSample + session.audioSampleCount;
+  const audioEndMs = (session: ActiveSession) => sampleToMs(audioEndSample(session));
+
   /** Slices the session buffer for [startMs, endMs), clamped to what we still hold. */
-  const sliceAudio = (session: ActiveSession, startMs: number, endMs: number): Float32Array => {
+  const sliceAudio = (session: ActiveSession, startMs: number, endMs: number) => {
     const all = concat(session.audio);
-    const from = Math.max(0, Math.floor(((startMs - session.audioStartMs) / 1000) * SAMPLE_RATE));
-    const to = Math.min(all.length, Math.ceil(((endMs - session.audioStartMs) / 1000) * SAMPLE_RATE));
-    return from >= to ? new Float32Array(0) : all.slice(from, to);
+    const requestedStart = Math.floor((startMs / 1000) * SAMPLE_RATE);
+    const requestedEnd = Math.ceil((endMs / 1000) * SAMPLE_RATE);
+    const actualStart = Math.max(session.audioStartSample, requestedStart);
+    const actualEnd = Math.min(audioEndSample(session), requestedEnd);
+    const from = actualStart - session.audioStartSample;
+    const to = actualEnd - session.audioStartSample;
+    return {
+      samples: from >= to ? new Float32Array(0) : all.slice(from, to),
+      startMs: sampleToMs(actualStart),
+      endMs: sampleToMs(actualEnd),
+    };
   };
 
   /** Drops audio older than the flushed utterance so memory stays bounded. */
   const trimAudio = (session: ActiveSession, upToMs: number) => {
     const all = concat(session.audio);
-    const cut = Math.max(0, Math.floor(((upToMs - session.audioStartMs) / 1000) * SAMPLE_RATE));
+    const targetSample = Math.floor((upToMs / 1000) * SAMPLE_RATE);
+    const cut = Math.min(all.length, Math.max(0, targetSample - session.audioStartSample));
     if (cut <= 0) return;
-    const remaining = all.slice(Math.min(cut, all.length));
+    const remaining = all.slice(cut);
     session.audio = remaining.length > 0 ? [remaining] : [];
-    session.audioStartMs = upToMs;
-    const releasedFrames = Math.floor(cut / FRAME_SAMPLES);
+    session.audioStartSample += cut;
+    session.audioSampleCount -= cut;
+    session.discardedCreditSamples += cut;
+    const releasedFrames = Math.min(session.bufferedFrames, Math.floor(session.discardedCreditSamples / FRAME_SAMPLES));
     if (releasedFrames > 0) {
-      session.bufferedFrames = Math.max(0, session.bufferedFrames - releasedFrames);
+      session.discardedCreditSamples -= releasedFrames * FRAME_SAMPLES;
+      session.bufferedFrames -= releasedFrames;
       post({ type: "credit", sessionId: session.request.sessionId, frames: releasedFrames });
     }
   };
 
+  const clearBufferedWork = (session: ActiveSession, releaseCredits = false) => {
+    if (releaseCredits && session.bufferedFrames > 0) {
+      post({ type: "credit", sessionId: session.request.sessionId, frames: session.bufferedFrames });
+    }
+    session.audio = [];
+    session.audioSampleCount = 0;
+    session.discardedCreditSamples = 0;
+    session.bufferedFrames = 0;
+    session.vadQueue = new Float32Array(0);
+    session.pendingMaxFlush = undefined;
+    session.gate.reset();
+  };
+
+  const failSession = (session: ActiveSession, error: unknown) => {
+    if (session.terminal) return;
+    session.terminal = true;
+    session.abort.abort();
+    clearBufferedWork(session);
+    emit(session, {
+      type: "error",
+      code: "INTERNAL",
+      fatal: true,
+      message: error instanceof Error ? error.message : "Local transcription failed",
+    });
+    emitState(session, "stopped");
+  };
+
+  const resetNativeVad = (session: ActiveSession): boolean => {
+    try {
+      runtime.vadReset();
+      return true;
+    } catch (error) {
+      failSession(session, error);
+      return false;
+    }
+  };
+
   const transcribeUtterance = async (session: ActiveSession, startMs: number, endMs: number) => {
-    const samples = sliceAudio(session, startMs, endMs);
+    const { samples, startMs: actualStartMs, endMs: actualEndMs } = sliceAudio(session, startMs, endMs);
     if (samples.length === 0 || session.terminal) return;
 
     const startedAt = now();
@@ -128,7 +187,7 @@ export function createWorkerController(
       if (session.terminal || session.abort.signal.aborted) return;
 
       const elapsedMs = now() - startedAt;
-      const audioDurationMs = endMs - startMs;
+      const audioDurationMs = actualEndMs - actualStartMs;
       session.consecutiveSlowTranscriptions = elapsedMs > audioDurationMs
         ? session.consecutiveSlowTranscriptions + 1
         : 0;
@@ -147,8 +206,8 @@ export function createWorkerController(
           id: `${session.request.sessionId}:${ordinal}`,
           ordinal,
           revision: 1,
-          startMs,
-          endMs,
+          startMs: actualStartMs,
+          endMs: actualEndMs,
           text,
           language: mapDetectedLanguage(result.language, result.languageProbability, session.request.candidateLanguages),
           isFinal: true,
@@ -157,18 +216,22 @@ export function createWorkerController(
       }
     } catch (error) {
       if (session.terminal || session.abort.signal.aborted) return;
-      session.terminal = true;
-      session.abort.abort();
-      emit(session, {
-        type: "error",
-        code: "INTERNAL",
-        fatal: true,
-        message: error instanceof Error ? error.message : "Local transcription failed",
-      });
-      emitState(session, "stopped");
+      failSession(session, error);
       return;
     }
-    trimAudio(session, endMs);
+  };
+
+  const finalizeUtterance = async (
+    session: ActiveSession,
+    decision: FlushDecision,
+    trimThroughMs: number,
+    endMs = decision.endMs,
+  ): Promise<boolean> => {
+    if (!resetNativeVad(session)) return false;
+    await transcribeUtterance(session, decision.startMs, endMs);
+    if (session.terminal) return false;
+    trimAudio(session, trimThroughMs);
+    return true;
   };
 
   /**
@@ -176,22 +239,38 @@ export function createWorkerController(
    * samples, so whatever does not fill a window is carried into the next push.
    */
   const runVad = async (session: ActiveSession, chunk: Float32Array) => {
-    const merged = concat([session.vadCarry, chunk]);
-    const windowCount = Math.floor(merged.length / VAD_WINDOW_SAMPLES);
-    if (windowCount === 0) {
-      session.vadCarry = merged;
-      return;
-    }
+    session.vadQueue = concat([session.vadQueue, chunk]);
 
-    const consumed = windowCount * VAD_WINDOW_SAMPLES;
-    session.vadCarry = merged.slice(consumed);
+    while (!session.terminal) {
+      if (session.pendingMaxFlush) {
+        const decision = session.pendingMaxFlush;
+        if (audioEndMs(session) < decision.endMs) return;
+        session.pendingMaxFlush = undefined;
+        const nextStartMs = decision.endMs - (2 * vadConfig.speechPadMs);
+        if (!await finalizeUtterance(session, decision, nextStartMs)) return;
+        continue;
+      }
 
-    const probs = runtime.vadProbs(merged.slice(0, consumed));
-    for (let index = 0; index < probs.length; index += 1) {
-      const windowStartMs = (session.windowIndex++ * VAD_WINDOW_SAMPLES * 1000) / SAMPLE_RATE;
-      const decision = session.gate.push(probs[index]!, windowStartMs);
-      if (decision.type === "flush") {
-        await transcribeUtterance(session, decision.startMs, decision.endMs);
+      if (session.vadQueue.length < VAD_WINDOW_SAMPLES) return;
+      const window = session.vadQueue.slice(0, VAD_WINDOW_SAMPLES);
+      session.vadQueue = session.vadQueue.slice(VAD_WINDOW_SAMPLES);
+
+      let probs: Float32Array;
+      try {
+        probs = runtime.vadProbs(window);
+      } catch (error) {
+        failSession(session, error);
+        return;
+      }
+      for (let index = 0; index < probs.length; index += 1) {
+        const windowStartMs = (session.windowIndex++ * VAD_WINDOW_SAMPLES * 1000) / SAMPLE_RATE;
+        const decision = session.gate.push(probs[index]!, windowStartMs);
+        if (decision.type !== "flush") continue;
+        if (decision.reason === "max-duration") {
+          session.pendingMaxFlush = decision;
+          break;
+        }
+        if (!await finalizeUtterance(session, decision, decision.endMs)) return;
       }
     }
   };
@@ -221,13 +300,16 @@ export function createWorkerController(
           ordinal: 0,
           terminal: false,
           audio: [],
-          audioStartMs: 0,
+          audioStartSample: 0,
+          audioSampleCount: 0,
+          discardedCreditSamples: 0,
           bufferedFrames: 0,
           consecutiveSlowTranscriptions: 0,
-          gate: createVadGate({ ...VAD_DEFAULTS, ...options.vad }),
-          vadCarry: new Float32Array(0),
+          gate: createVadGate(vadConfig),
+          vadQueue: new Float32Array(0),
           windowIndex: 0,
         };
+        if (!resetNativeVad(active)) return;
         emitState(active, "listening");
         return;
       }
@@ -240,6 +322,7 @@ export function createWorkerController(
         }
         const chunk = toFloat(message.frame);
         active.audio.push(chunk);
+        active.audioSampleCount += chunk.length;
         active.bufferedFrames += 1;
         await runVad(active, chunk);
         return;
@@ -248,12 +331,28 @@ export function createWorkerController(
       case "stop": {
         if (!active || active.terminal || active.request.sessionId !== message.sessionId) return;
         emitState(active, "draining");
-        const nowMs = active.audioStartMs + (active.bufferedFrames * FRAME_MS);
-        const decision = active.gate.flushPending(nowMs);
-        if (decision.type === "flush") {
-          await transcribeUtterance(active, decision.startMs, decision.endMs);
+        const availableEndMs = audioEndMs(active);
+        if (active.pendingMaxFlush) {
+          const decision = active.pendingMaxFlush;
+          active.pendingMaxFlush = undefined;
+          active.gate.reset();
+          active.vadQueue = new Float32Array(0);
+          await finalizeUtterance(active, decision, availableEndMs, availableEndMs);
+        } else {
+          const decision = active.gate.flushPending(availableEndMs);
+          if (decision.type === "flush") {
+            await finalizeUtterance(active, decision, availableEndMs, Math.min(decision.endMs, availableEndMs));
+          } else {
+            resetNativeVad(active);
+          }
         }
         if (!active.terminal) {
+          // A normal stop is terminal for this session, so release any frames
+          // that did not belong to a transcribed utterance (silence or a
+          // sub-minimum speech run) and drop every retained audio/VAD array.
+          // Flush paths already credited discarded frames, making the
+          // remaining bufferedFrames count exactly the uncredited remainder.
+          clearBufferedWork(active, true);
           active.terminal = true;
           emitState(active, "stopped");
         }
@@ -262,10 +361,11 @@ export function createWorkerController(
 
       case "cancel": {
         if (!active || active.terminal || active.request.sessionId !== message.sessionId) return;
+        active.gate.reset();
+        if (!resetNativeVad(active)) return;
         active.terminal = true;
         active.abort.abort();
-        active.audio = [];
-        active.gate.reset();
+        clearBufferedWork(active);
         emitState(active, "stopped");
         return;
       }
