@@ -35,10 +35,10 @@ export class SessionController {
   private readonly onLocalError: (message: string) => void;
   private readonly onBackpressureWarning: (message: string) => void;
   private active: ActiveSession | undefined;
-  // Kept across start/stop cycles: engine.prepare() is idempotent once already
-  // prepared, so reusing the same engine means the model only ever loads once
-  // per page session instead of being reloaded from scratch on every recording.
-  // Only torn down by dispose() (unmount).
+  // Published only after a current start safely opens a session. Once published it
+  // is kept across stop/start cycles, so an already prepared model is reused rather
+  // than loaded from scratch for every recording. Pending attempts keep their engine
+  // private because LocalWhisperEngine.prepare() cannot safely run concurrently.
   private engine: TranscriptionEngine | undefined;
   // Bumped by stop()/clear() so a startWithId() call already in flight (e.g. still
   // downloading the model) can detect it was cancelled and discard its result
@@ -99,44 +99,66 @@ export class SessionController {
     await this.clear(sessionId);
     const token = ++this.startToken;
     const request: SessionRequest = { sessionId, candidateLanguages: candidateLanguages as SessionRequest["candidateLanguages"], mode: "transcribe", audio: AUDIO };
-    const engine = this.engine ?? this.engineFactory();
-    this.engine = engine;
+    const cachedEngine = this.engine;
+    const engine = cachedEngine ?? this.engineFactory();
+    const ownsPrivateEngine = cachedEngine === undefined;
+    let publishedEngine = cachedEngine !== undefined;
     const abortController = new AbortController();
     let active: ActiveSession | undefined;
+    const discardPrivateEngine = async () => {
+      if (ownsPrivateEngine && !publishedEngine) await engine.dispose();
+    };
     try {
-      let inspection: EngineInspection;
-      try {
-        inspection = await engine.inspect();
-      } catch (error) {
-        if (token !== this.startToken) return sessionId;
-        throw error;
+      const inspection: EngineInspection = await engine.inspect();
+      if (token !== this.startToken) {
+        await discardPrivateEngine();
+        return sessionId;
       }
-      if (token !== this.startToken) return sessionId;
       if (!inspection.available) throw new Error(inspection.reason ?? "Local transcription is unavailable");
       await engine.prepare(request);
       if (token !== this.startToken) {
-        // stop()/clear() ran while the model was still loading; don't open a session or
-        // request the microphone for a start the user already cancelled. The in-flight
-        // prepare() can't safely be left running for a later start to reuse (a concurrent
-        // prepare() on the same engine would race), so this attempt is discarded.
-        if (this.engine === engine) this.engine = undefined;
-        await engine.dispose();
+        await discardPrivateEngine();
         return sessionId;
       }
       const session = await engine.open(request);
       if (token !== this.startToken) {
-        if (this.engine === engine) this.engine = undefined;
         abortController.abort();
         await session.cancel().catch(() => undefined);
-        await engine.dispose();
+        await discardPrivateEngine();
         return sessionId;
       }
+      this.engine = engine;
+      publishedEngine = true;
       active = { id: sessionId, engine, session, abortController, queuedFrames: [] };
       this.active = active;
       active.unsubscribe = session.subscribe((event) => this.handleEvent(active!, event));
       active.microphone = await this.microphoneFactory({ signal: abortController.signal, onFrame: (frame) => this.pushFrame(active!, frame) });
+      if (token !== this.startToken) {
+        if (this.active === active) {
+          this.active = undefined;
+          await this.release(active, true);
+        } else {
+          await active.microphone?.stop();
+          active.unsubscribe?.();
+        }
+        return sessionId;
+      }
       return sessionId;
     } catch (error) {
+      if (token !== this.startToken) {
+        abortController.abort();
+        if (active) {
+          if (this.active === active) {
+            this.active = undefined;
+            await this.release(active, true);
+          } else {
+            await active.microphone?.stop();
+            active.unsubscribe?.();
+          }
+        }
+        await discardPrivateEngine();
+        return sessionId;
+      }
       if (this.active === active) this.active = undefined;
       this.onLocalError(error instanceof Error ? error.message : "Local transcription is unavailable");
       abortController.abort();

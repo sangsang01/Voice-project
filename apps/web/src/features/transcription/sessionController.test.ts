@@ -28,6 +28,70 @@ function createController(engine: PendingInspectionEngine, onLocalError = vi.fn(
 }
 
 describe("SessionController inspection cancellation", () => {
+  it("keeps a pending prepare engine private from a newer restart", async () => {
+    const firstEngine = new PendingInspectionEngine();
+    const secondEngine = new PendingInspectionEngine();
+    firstEngine.inspect.mockResolvedValue({ available: true });
+    secondEngine.inspect.mockResolvedValue({ available: true });
+    let resolveFirstPrepare: () => void = () => undefined;
+    firstEngine.prepare.mockImplementationOnce(() => new Promise<undefined>((resolve) => { resolveFirstPrepare = () => resolve(undefined); }));
+    const factory = vi.fn<() => TranscriptionEngine>()
+      .mockReturnValueOnce(firstEngine)
+      .mockReturnValueOnce(secondEngine);
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: factory,
+      microphoneFactory: vi.fn(async () => ({ stop: vi.fn(async () => undefined) })),
+      onLocalError: vi.fn(),
+    });
+
+    const firstStart = controller.start(["en-US"]);
+    await vi.waitFor(() => expect(firstEngine.prepare).toHaveBeenCalledTimes(1));
+    const secondStart = controller.clearAndRestart(["en-US"]);
+    await expect(secondStart).resolves.toEqual(expect.any(String));
+
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(secondEngine.prepare).toHaveBeenCalledTimes(1);
+    expect(secondEngine.open).toHaveBeenCalledTimes(1);
+
+    resolveFirstPrepare();
+    await expect(firstStart).resolves.toEqual(expect.any(String));
+    expect(firstEngine.dispose).toHaveBeenCalledTimes(1);
+    expect(secondEngine.dispose).not.toHaveBeenCalled();
+
+    await controller.dispose();
+    expect(secondEngine.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("silences a stale prepare rejection without disturbing the newer engine", async () => {
+    const firstEngine = new PendingInspectionEngine();
+    const secondEngine = new PendingInspectionEngine();
+    firstEngine.inspect.mockResolvedValue({ available: true });
+    secondEngine.inspect.mockResolvedValue({ available: true });
+    let rejectFirstPrepare: (error: Error) => void = () => undefined;
+    firstEngine.prepare.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectFirstPrepare = reject; }));
+    const factory = vi.fn<() => TranscriptionEngine>()
+      .mockReturnValueOnce(firstEngine)
+      .mockReturnValueOnce(secondEngine);
+    const onLocalError = vi.fn();
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: factory,
+      microphoneFactory: vi.fn(async () => ({ stop: vi.fn(async () => undefined) })),
+      onLocalError,
+    });
+
+    const firstStart = controller.start(["en-US"]);
+    await vi.waitFor(() => expect(firstEngine.prepare).toHaveBeenCalledTimes(1));
+    await expect(controller.clearAndRestart(["en-US"])).resolves.toEqual(expect.any(String));
+    rejectFirstPrepare(new Error("first prepare failed"));
+
+    await expect(firstStart).resolves.toEqual(expect.any(String));
+    expect(firstEngine.dispose).toHaveBeenCalledTimes(1);
+    expect(secondEngine.dispose).not.toHaveBeenCalled();
+    expect(onLocalError).not.toHaveBeenCalled();
+  });
+
   it("does not prepare or report an error when a stopped inspection later becomes available", async () => {
     const engine = new PendingInspectionEngine();
     let resolveInspection: (inspection: EngineInspection) => void = () => undefined;
@@ -42,7 +106,7 @@ describe("SessionController inspection cancellation", () => {
     await expect(start).resolves.toEqual(expect.any(String));
     expect(engine.prepare).not.toHaveBeenCalled();
     expect(engine.open).not.toHaveBeenCalled();
-    expect(engine.dispose).not.toHaveBeenCalled();
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
     expect(onLocalError).not.toHaveBeenCalled();
 
     await controller.dispose();
@@ -63,7 +127,7 @@ describe("SessionController inspection cancellation", () => {
     await expect(start).resolves.toEqual(expect.any(String));
     expect(engine.prepare).not.toHaveBeenCalled();
     expect(engine.open).not.toHaveBeenCalled();
-    expect(engine.dispose).not.toHaveBeenCalled();
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
     expect(onLocalError).not.toHaveBeenCalled();
   });
 
@@ -86,26 +150,37 @@ describe("SessionController inspection cancellation", () => {
   });
 
   it("does not let an older inspection dispose the engine used by a newer start", async () => {
-    const engine = new PendingInspectionEngine();
+    const firstEngine = new PendingInspectionEngine();
+    const secondEngine = new PendingInspectionEngine();
     let resolveFirstInspection: (inspection: EngineInspection) => void = () => undefined;
-    engine.inspect
+    firstEngine.inspect
       .mockImplementationOnce(() => new Promise((resolve) => { resolveFirstInspection = resolve; }))
+    secondEngine.inspect
       .mockResolvedValueOnce({ available: true });
-    const { controller, onLocalError } = createController(engine);
+    const onLocalError = vi.fn();
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: vi.fn<() => TranscriptionEngine>()
+        .mockReturnValueOnce(firstEngine)
+        .mockReturnValueOnce(secondEngine),
+      microphoneFactory: vi.fn(async () => ({ stop: vi.fn(async () => undefined) })),
+      onLocalError,
+    });
 
     const firstStart = controller.start(["en-US"]);
-    await vi.waitFor(() => expect(engine.inspect).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(firstEngine.inspect).toHaveBeenCalledTimes(1));
     const secondStart = controller.start(["en-US"]);
     await expect(secondStart).resolves.toEqual(expect.any(String));
     resolveFirstInspection({ available: true });
 
     await expect(firstStart).resolves.toEqual(expect.any(String));
-    expect(engine.prepare).toHaveBeenCalledTimes(1);
-    expect(engine.open).toHaveBeenCalledTimes(1);
-    expect(engine.dispose).not.toHaveBeenCalled();
+    expect(firstEngine.dispose).toHaveBeenCalledTimes(1);
+    expect(secondEngine.prepare).toHaveBeenCalledTimes(1);
+    expect(secondEngine.open).toHaveBeenCalledTimes(1);
+    expect(secondEngine.dispose).not.toHaveBeenCalled();
     expect(onLocalError).not.toHaveBeenCalled();
 
     await controller.dispose();
-    expect(engine.dispose).toHaveBeenCalledTimes(1);
+    expect(secondEngine.dispose).toHaveBeenCalledTimes(1);
   });
 });

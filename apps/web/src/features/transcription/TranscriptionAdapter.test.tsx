@@ -11,6 +11,7 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 
 const defaultLocalEngine = vi.hoisted(() => ({
+  created: 0,
   onProgress: undefined as ((progress: number) => void) | undefined,
   inspect: vi.fn(async () => ({ available: true })),
   prepare: vi.fn(async () => undefined),
@@ -26,6 +27,7 @@ vi.mock("@voice/local-whisper-engine", () => ({
     public readonly dispose = defaultLocalEngine.dispose;
 
     public constructor(options: { onProgress?: (progress: number) => void } = {}) {
+      defaultLocalEngine.created += 1;
       defaultLocalEngine.onProgress = options.onProgress;
     }
   },
@@ -177,7 +179,39 @@ describe("TranscriptionAdapter", () => {
     act(() => defaultLocalEngine.onProgress?.(0.42));
 
     expect(await screen.findByText("Preparing local model 42%")).toBeVisible();
-    expect(screen.getByRole("progressbar", { name: "Local model preparation" })).toHaveAttribute("value", "0.42");
+    const progress = screen.getByRole("progressbar", { name: "Local model preparation" });
+    expect(progress).toHaveAttribute("value", "0.42");
+    expect(progress.closest(".transcript")).toBeNull();
+  });
+
+  it("keeps the latest model load visible when an older run settles", async () => {
+    defaultLocalEngine.created = 0;
+    defaultLocalEngine.inspect.mockReset();
+    defaultLocalEngine.prepare.mockReset();
+    defaultLocalEngine.open.mockReset();
+    defaultLocalEngine.dispose.mockReset();
+    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
+    let resolveFirstPrepare: () => void = () => undefined;
+    defaultLocalEngine.prepare
+      .mockImplementationOnce(() => new Promise<undefined>((resolve) => { resolveFirstPrepare = () => resolve(undefined); }))
+      .mockImplementationOnce(() => new Promise<never>(() => undefined));
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Clear & Restart" }));
+    await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(2));
+    expect(defaultLocalEngine.created).toBe(2);
+    act(() => defaultLocalEngine.onProgress?.(0.42));
+    expect(await screen.findByText("Preparing local model 42%")).toBeVisible();
+
+    resolveFirstPrepare();
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent("Preparing");
+      expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
+      expect(screen.getByText("Preparing local model 42%")).toBeVisible();
+    });
   });
 
   it("surfaces unsupported local capabilities without preparing or opening an engine", async () => {

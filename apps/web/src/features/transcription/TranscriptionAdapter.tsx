@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { EarthGlobe } from "../../components/EarthGlobe";
 import { LocalWhisperEngine } from "@voice/local-whisper-engine";
 import { SessionController, type EngineFactory, type MicrophoneFactory } from "./sessionController";
@@ -21,6 +21,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
   const [starting, setStarting] = useState(false);
   const [loadProgress, setLoadProgress] = useState<number>();
   const [now, setNow] = useState(() => new Date());
+  const runGeneration = useRef(0);
 
   // Constructed lazily on first render rather than from props/state:
   // SessionController's constructor is pure (only assigns fields, no
@@ -35,7 +36,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
     onBackpressureWarning: setBackpressureWarning,
   }));
   useEffect(() => {
-    return () => { void controller.dispose(); };
+    return () => { runGeneration.current += 1; void controller.dispose(); };
   }, [controller]);
 
   useEffect(() => {
@@ -53,8 +54,9 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
   };
   const run = async (operation: () => Promise<unknown>) => {
     if (!hasValidSelection) { setSelectionError("Select between 1 and 4 unique languages"); return; }
+    const generation = ++runGeneration.current;
     setSelectionError(undefined); setLocalError(undefined); setBackpressureWarning(undefined); setLoadProgress(undefined); setStarting(true);
-    try { await operation(); } catch { /* controller emits the normalized local error */ } finally { setStarting(false); }
+    try { await operation(); } catch { /* controller emits the normalized local error */ } finally { if (runGeneration.current === generation) setStarting(false); }
   };
 
   return (
@@ -64,7 +66,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
           <header className="console-title"><p>Voice console</p><h1>Earth Assistant</h1></header>
           <div aria-label="Candidate languages">{LANGUAGES.map(([tag, label]) => <button aria-pressed={candidateLanguages.includes(tag)} className="control-button" key={tag} onClick={() => toggleLanguage(tag)} type="button">{label}</button>)}</div>
           <button className="control-button" disabled={preparing || listening} onClick={() => void run(() => controller.start(candidateLanguages))} type="button">Start</button>
-          <button className="control-button" disabled={!preparing && !listening} onClick={() => { setStarting(false); setLoadProgress(undefined); void controller.stop(); }} type="button">Stop</button>
+          <button className="control-button" disabled={!preparing && !listening} onClick={() => { runGeneration.current += 1; setStarting(false); setLoadProgress(undefined); void controller.stop(); }} type="button">Stop</button>
           <button className="control-button" onClick={() => void run(() => controller.clearAndRestart(candidateLanguages))} type="button">Clear &amp; Restart</button>
           <div className="console-meta"><p aria-atomic="true" aria-live="polite" className="status" role="status"><span className={`status-dot${listening ? " status-dot--listening" : ""}`} aria-hidden="true" />{preparing ? "Preparing" : listening ? "Listening" : "Standby"}</p><p className="engine-mode">Local transcription (on this device)</p><p className="clock">Local {formatClock(now, false)} · UTC {formatClock(now, true)}</p></div>
         </aside>
@@ -72,10 +74,10 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
           <EarthGlobe listening={listening} />
           <div className="transcript" aria-live="polite">
             {state.segments.length === 0 ? <span>Press Start and speak — your words appear here.</span> : state.segments.map((segment) => <p key={segment.id}><span>{segment.text}</span> <small>{segment.language.tag}</small></p>)}
-            {starting && <p aria-atomic="true" aria-live="polite">Preparing local model{loadProgress === undefined ? "…" : ` ${Math.round(loadProgress * 100)}%`}{loadProgress !== undefined && <progress aria-label="Local model preparation" max={1} value={loadProgress} />}</p>}
             {state.warnings.map((warning, index) => <p key={`${warning.code}-${index}`}>{warning.message}</p>)}
             {backpressureWarning && <p>{backpressureWarning}</p>}
           </div>
+          {starting && <p aria-atomic="true" aria-live="polite">Preparing local model{loadProgress === undefined ? "…" : ` ${Math.round(loadProgress * 100)}%`}{loadProgress !== undefined && <progress aria-label="Local model preparation" max={1} value={loadProgress} />}</p>}
           {error && <p role="alert">{error}</p>}
         </section>
       </section>
