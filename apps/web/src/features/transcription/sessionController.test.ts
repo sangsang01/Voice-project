@@ -147,6 +147,59 @@ describe("SessionController inspection cancellation", () => {
     expect(secondEngine.open).toHaveBeenCalledTimes(1);
   });
 
+  it("awaits a cached-engine eviction already pending when disposed", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect
+      .mockResolvedValueOnce({ available: true })
+      .mockRejectedValueOnce(new Error("worker is no longer available"));
+    let resolveEngineDispose: () => void = () => undefined;
+    engine.dispose.mockImplementation(
+      () => new Promise<undefined>((resolve) => { resolveEngineDispose = () => resolve(undefined); }),
+    );
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: vi.fn(async () => undefined) })),
+      onLocalError: vi.fn(),
+    });
+    await controller.start(["en-US"]);
+    await controller.stop();
+
+    const failedRestart = controller.start(["en-US"]);
+    await vi.waitFor(() => expect(engine.dispose).toHaveBeenCalledTimes(1));
+    const disposing = controller.dispose();
+    const firstOutcome = await Promise.race([
+      disposing.then(() => "disposed" as const),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 0)),
+    ]);
+    expect(firstOutcome).toBe("pending");
+
+    resolveEngineDispose();
+    await Promise.all([failedRestart, disposing]);
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("retires and reports a synchronous engine factory failure", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    const factory = vi.fn<() => TranscriptionEngine>()
+      .mockImplementationOnce(() => { throw new Error("engine construction failed"); })
+      .mockReturnValueOnce(engine);
+    const onLocalError = vi.fn();
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: factory,
+      microphoneFactory: vi.fn(async () => ({ stop: vi.fn(async () => undefined) })),
+      onLocalError,
+    });
+
+    await expect(controller.start(["en-US"])).rejects.toThrow("engine construction failed");
+    expect(onLocalError).toHaveBeenCalledWith("engine construction failed");
+
+    await controller.start(["en-US"]);
+    expect(engine.open).toHaveBeenCalledTimes(1);
+  });
+
   it("settles and disposes a never-settling private inspection when disposed", async () => {
     const engine = new PendingInspectionEngine();
     let rejectInspection: (error: Error) => void = () => undefined;
@@ -276,6 +329,26 @@ describe("SessionController inspection cancellation", () => {
 
     resolveEngineDispose();
     await disposing;
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains an observed private-disposal rejection for terminal dispose", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    engine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
+    let rejectEngineDispose: (error: Error) => void = () => undefined;
+    engine.dispose.mockImplementation(
+      () => new Promise<undefined>((_resolve, reject) => { rejectEngineDispose = reject; }),
+    );
+    const { controller } = createController(engine);
+    const start = controller.start(["en-US"]);
+    await vi.waitFor(() => expect(engine.prepare).toHaveBeenCalledTimes(1));
+    await controller.stop();
+    await start;
+    rejectEngineDispose(new Error("private disposal failed"));
+    await Promise.resolve();
+
+    await expect(controller.dispose()).rejects.toThrow("private disposal failed");
     expect(engine.dispose).toHaveBeenCalledTimes(1);
   });
 

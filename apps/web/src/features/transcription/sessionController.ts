@@ -59,7 +59,9 @@ export class SessionController {
   private engine: TranscriptionEngine | undefined;
   private currentAttempt: StartAttempt | undefined;
   private releasing: Promise<void> | undefined;
-  private readonly privateDisposals = new Set<Promise<void>>();
+  private readonly engineDisposals = new Set<Promise<void>>();
+  private readonly engineDisposalFailures: unknown[] = [];
+  private cachedEngineDisposal: Promise<void> | undefined;
   private disposal: Promise<void> | undefined;
   private disposed = false;
 
@@ -105,13 +107,20 @@ export class SessionController {
     this.disposed = true;
     const attempt = this.cancelCurrentAttempt();
     this.disposal = (async () => {
-      try {
-        await this.clearActive();
-      } finally {
-        await this.disposePrivateEngine(attempt);
-        await this.awaitPrivateDisposals();
-        await this.dropEngine();
-      }
+      let failed = false;
+      let failure: unknown;
+      const recordFailure = (error: unknown) => {
+        if (!failed) {
+          failed = true;
+          failure = error;
+        }
+      };
+      try { await this.clearActive(); }
+      catch (error) { recordFailure(error); }
+      void this.disposePrivateEngine(attempt);
+      void this.dropEngine();
+      for (const error of await this.drainEngineDisposals()) recordFailure(error);
+      if (failed) throw failure;
     })();
     return this.disposal;
   }
@@ -140,24 +149,26 @@ export class SessionController {
       mode: "transcribe",
       audio: AUDIO,
     };
-    const cachedEngine = this.engine;
-    let engine = cachedEngine;
-    if (!engine) {
-      const progressSource: { engine?: TranscriptionEngine } = {};
-      engine = this.engineFactory({
-        onProgress: (progress) => {
-          if (progressSource.engine) this.reportProgress(progressSource.engine, progress);
-        },
-      });
-      progressSource.engine = engine;
-    }
-    attempt.engine = engine;
-    attempt.ownsPrivateEngine = cachedEngine === undefined;
-    attempt.publishedEngine = cachedEngine !== undefined;
     const abortController = new AbortController();
+    const cachedEngine = this.engine;
+    let engine: TranscriptionEngine | undefined;
     let active: ActiveSession | undefined;
 
     try {
+      engine = cachedEngine;
+      if (!engine) {
+        const progressSource: { engine?: TranscriptionEngine } = {};
+        engine = this.engineFactory({
+          onProgress: (progress) => {
+            if (progressSource.engine) this.reportProgress(progressSource.engine, progress);
+          },
+        });
+        progressSource.engine = engine;
+      }
+      attempt.engine = engine;
+      attempt.ownsPrivateEngine = cachedEngine === undefined;
+      attempt.publishedEngine = cachedEngine !== undefined;
+
       const inspection = await this.awaitAttempt(attempt, Promise.resolve(engine.inspect()));
       if (!this.isCurrent(attempt) || inspection === undefined) return attempt.sessionId;
       if (!inspection.available) throw new Error(inspection.reason ?? "Local transcription is unavailable");
@@ -205,7 +216,7 @@ export class SessionController {
         this.active = undefined;
         try { await this.release(active, true); }
         catch (cleanupError) { failure = cleanupError; }
-      } else if (this.engine === engine) {
+      } else if (engine && this.engine === engine) {
         // A previously cached engine that now fails inspection, preparation, or
         // open is no longer usable; evict only this exact current cache entry.
         try { await this.dropEngine(); }
@@ -269,16 +280,30 @@ export class SessionController {
   private disposePrivateEngine(attempt: StartAttempt | undefined): Promise<void> | undefined {
     if (!attempt || !attempt.ownsPrivateEngine || attempt.publishedEngine || !attempt.engine) return undefined;
     if (!attempt.disposal) {
-      const disposal = attempt.engine.dispose().catch(() => undefined);
+      const disposal = this.startEngineDisposal(attempt.engine);
       attempt.disposal = disposal;
-      this.privateDisposals.add(disposal);
-      void disposal.then(() => this.privateDisposals.delete(disposal));
     }
     return attempt.disposal;
   }
 
-  private async awaitPrivateDisposals(): Promise<void> {
-    while (this.privateDisposals.size > 0) await Promise.all(this.privateDisposals);
+  private startEngineDisposal(engine: TranscriptionEngine): Promise<void> {
+    let disposal: Promise<void>;
+    try { disposal = Promise.resolve(engine.dispose()); }
+    catch (error) { disposal = Promise.reject(error); }
+    this.engineDisposals.add(disposal);
+    void disposal.then(
+      () => { this.engineDisposals.delete(disposal); },
+      (error) => {
+        this.engineDisposalFailures.push(error);
+        this.engineDisposals.delete(disposal);
+      },
+    );
+    return disposal;
+  }
+
+  private async drainEngineDisposals(): Promise<readonly unknown[]> {
+    while (this.engineDisposals.size > 0) await Promise.allSettled(this.engineDisposals);
+    return this.engineDisposalFailures;
   }
 
   private reportProgress(engine: TranscriptionEngine, progress: number): void {
@@ -316,11 +341,18 @@ export class SessionController {
     else await this.releasing;
   }
 
-  private async dropEngine(): Promise<void> {
+  private dropEngine(): Promise<void> {
+    if (this.cachedEngineDisposal) return this.cachedEngineDisposal;
     const engine = this.engine;
-    if (!engine) return;
+    if (!engine) return Promise.resolve();
     this.engine = undefined;
-    await engine.dispose();
+    const disposal = this.startEngineDisposal(engine);
+    this.cachedEngineDisposal = disposal;
+    void disposal.then(
+      () => { if (this.cachedEngineDisposal === disposal) this.cachedEngineDisposal = undefined; },
+      () => { if (this.cachedEngineDisposal === disposal) this.cachedEngineDisposal = undefined; },
+    );
+    return disposal;
   }
 
   // Teardown is shared by concurrent stop/clear/dispose calls. The first caller's
