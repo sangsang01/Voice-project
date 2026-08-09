@@ -42,6 +42,113 @@ function createController(engine: PendingInspectionEngine, onLocalError = vi.fn(
 }
 
 describe("SessionController terminal event ownership", () => {
+  it.each([
+    ["fatal", "stop"],
+    ["fatal", "clear"],
+    ["fatal", "dispose"],
+    ["stopped", "stop"],
+    ["stopped", "clear"],
+    ["stopped", "dispose"],
+  ] as const)("publishes %s cleanup before a reentrant dispatch %s", async (terminalKind, operation) => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    const microphoneStop = vi.fn(async () => undefined);
+    let reentrant: Promise<void> | undefined;
+    let triggerReentrancy = false;
+    const dispatch = vi.fn((action: EngineEvent | { type: "clear"; nextSessionId: string }) => {
+      if (!triggerReentrancy || action.type === "clear") return;
+      triggerReentrancy = false;
+      reentrant = operation === "stop"
+        ? controller.stop()
+        : operation === "clear"
+          ? controller.clear()
+          : controller.dispose();
+    });
+    const controller = new SessionController({
+      dispatch,
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+    });
+    const sessionId = await controller.start(["en-US"]);
+    dispatch.mockClear();
+    triggerReentrancy = true;
+    const fatal: EngineEvent = {
+      type: "error", sessionId, sequence: 1, code: "INTERNAL", fatal: true, message: "worker failed",
+    };
+    const stopped: EngineEvent = {
+      type: "state", sessionId, sequence: terminalKind === "fatal" ? 2 : 1, state: "stopped",
+    };
+
+    if (terminalKind === "fatal") engine.emit(fatal);
+    engine.emit(stopped);
+    await reentrant;
+
+    const engineEvents = dispatch.mock.calls
+      .map(([action]) => action)
+      .filter((action): action is EngineEvent => action.type !== "clear");
+    expect(engineEvents).toEqual(terminalKind === "fatal" ? [fatal, stopped] : [stopped]);
+    expect(engine.session.stop).not.toHaveBeenCalled();
+    expect(engine.session.cancel).not.toHaveBeenCalled();
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispatches fatal before a synchronous stopped event caused by microphone cleanup", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    const dispatch = vi.fn();
+    let sessionId = "";
+    const stopped = (): EngineEvent => ({ type: "state", sessionId, sequence: 2, state: "stopped" });
+    const microphoneStop = vi.fn(async () => { engine.emit(stopped()); });
+    const controller = new SessionController({
+      dispatch,
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+    });
+    sessionId = await controller.start(["en-US"]);
+    dispatch.mockClear();
+    const fatal: EngineEvent = {
+      type: "error", sessionId, sequence: 1, code: "INTERNAL", fatal: true, message: "worker failed",
+    };
+
+    engine.emit(fatal);
+    await vi.waitFor(() => expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1));
+
+    expect(dispatch.mock.calls.map(([event]) => event)).toEqual([fatal, stopped()]);
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts and settles terminal cleanup when dispatch throws", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    const microphoneStop = vi.fn(async () => undefined);
+    let throwTerminal = false;
+    const dispatch = vi.fn((action: EngineEvent | { type: "clear" }) => {
+      if (throwTerminal && action.type === "error") throw new Error("dispatch failed");
+    });
+    const controller = new SessionController({
+      dispatch,
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: microphoneStop })),
+    });
+    const sessionId = await controller.start(["en-US"]);
+    throwTerminal = true;
+
+    expect(() => engine.emit({
+      type: "error", sessionId, sequence: 1, code: "INTERNAL", fatal: true, message: "worker failed",
+    })).toThrow("dispatch failed");
+
+    const outcome = await Promise.race([
+      controller.stop().then(() => "settled" as const),
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 0)),
+    ]);
+    expect(outcome).toBe("settled");
+    expect(microphoneStop).toHaveBeenCalledTimes(1);
+    expect(engine.unsubscribes[0]).toHaveBeenCalledTimes(1);
+    expect(engine.session.stop).not.toHaveBeenCalled();
+    expect(engine.session.cancel).not.toHaveBeenCalled();
+  });
+
   it("retires capture after a fatal error while preserving the following stopped event", async () => {
     const engine = new PendingInspectionEngine();
     engine.inspect.mockResolvedValue({ available: true });
@@ -624,6 +731,63 @@ describe("SessionController inspection cancellation", () => {
     rejectDispose(new Error("shared cached disposal failed"));
     await expect(disposing).rejects.toThrow("shared cached disposal failed");
     await expect(failedRestart).resolves.toEqual(expect.any(String));
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses one rejecting disposal across overlapping private attempts with the same engine", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockImplementation(() => new Promise<never>(() => undefined));
+    let rejectDisposal: (error: Error) => void = () => undefined;
+    const sharedDisposal = new Promise<undefined>((_resolve, reject) => { rejectDisposal = reject; });
+    engine.dispose.mockImplementation(() => sharedDisposal);
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(),
+      onLocalError: vi.fn(),
+    });
+
+    const firstStart = controller.start(["en-US"]);
+    await vi.waitFor(() => expect(engine.inspect).toHaveBeenCalledTimes(1));
+    const secondStart = controller.start(["en-US"]);
+    await vi.waitFor(() => expect(engine.inspect).toHaveBeenCalledTimes(2));
+    await controller.stop();
+    await Promise.all([firstStart, secondStart]);
+
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+    const disposing = controller.dispose();
+    rejectDisposal(new Error("shared private disposal failed"));
+    await expect(disposing).rejects.toThrow("shared private disposal failed");
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses a private disposal when the same engine identity is later cached", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect
+      .mockImplementationOnce(() => new Promise<never>(() => undefined))
+      .mockResolvedValueOnce({ available: true });
+    let resolveDisposal: () => void = () => undefined;
+    const sharedDisposal = new Promise<undefined>((resolve) => {
+      resolveDisposal = () => resolve(undefined);
+    });
+    engine.dispose.mockImplementation(() => sharedDisposal);
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: () => engine,
+      microphoneFactory: vi.fn(async () => ({ stop: vi.fn(async () => undefined) })),
+      onLocalError: vi.fn(),
+    });
+
+    const privateStart = controller.start(["en-US"]);
+    await vi.waitFor(() => expect(engine.inspect).toHaveBeenCalledTimes(1));
+    await controller.start(["en-US"]);
+    await vi.waitFor(() => expect(engine.dispose).toHaveBeenCalledTimes(1));
+
+    const disposing = controller.dispose();
+    await Promise.resolve();
+    expect(engine.dispose).toHaveBeenCalledTimes(1);
+    resolveDisposal();
+    await Promise.all([privateStart, disposing]);
     expect(engine.dispose).toHaveBeenCalledTimes(1);
   });
 

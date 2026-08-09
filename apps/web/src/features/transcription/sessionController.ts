@@ -67,7 +67,7 @@ export class SessionController {
   private releasing: Promise<void> | undefined;
   private readonly engineDisposals = new Set<Promise<void>>();
   private readonly engineDisposalFailures: unknown[] = [];
-  private readonly cachedEngineDisposals = new WeakMap<TranscriptionEngine, Promise<void>>();
+  private readonly engineDisposalsByIdentity = new WeakMap<TranscriptionEngine, Promise<void>>();
   private disposal: Promise<void> | undefined;
   private disposed = false;
 
@@ -297,9 +297,12 @@ export class SessionController {
   }
 
   private startEngineDisposal(engine: TranscriptionEngine): Promise<void> {
+    const existing = this.engineDisposalsByIdentity.get(engine);
+    if (existing) return existing;
     let disposal: Promise<void>;
     try { disposal = Promise.resolve(engine.dispose()); }
     catch (error) { disposal = Promise.reject(error); }
+    this.engineDisposalsByIdentity.set(engine, disposal);
     this.engineDisposals.add(disposal);
     void disposal.then(
       () => { this.engineDisposals.delete(disposal); },
@@ -331,8 +334,10 @@ export class SessionController {
     if (event.sessionId !== active.id) return;
 
     if (this.active === active) {
-      this.dispatch(event);
-      if (!this.isTerminalEvent(event)) return;
+      if (!this.isTerminalEvent(event)) {
+        this.dispatch(event);
+        return;
+      }
 
       this.active = undefined;
       if (this.currentAttempt === active.attempt) {
@@ -340,7 +345,7 @@ export class SessionController {
         active.attempt.cancel();
       }
       active.retiringEvents = event.type === "error" ? "fatal-followup" : undefined;
-      this.observeTerminalRelease(active, this.release(active, "already-terminal"));
+      void this.release(active, "already-terminal", () => this.dispatch(event));
       return;
     }
 
@@ -438,17 +443,13 @@ export class SessionController {
     const engine = this.engine;
     if (!engine) return Promise.resolve();
     this.engine = undefined;
-    const pending = this.cachedEngineDisposals.get(engine);
-    if (pending) return pending;
-    const disposal = this.startEngineDisposal(engine);
-    this.cachedEngineDisposals.set(engine, disposal);
-    return disposal;
+    return this.startEngineDisposal(engine);
   }
 
   // Publish ownership before invoking engine or capture callbacks: either can
   // synchronously replay terminal events or trigger a concurrent controller call.
   // The first release mode wins and all later callers await this exact promise.
-  private release(active: ActiveSession, mode: ReleaseMode): Promise<void> {
+  private release(active: ActiveSession, mode: ReleaseMode, afterPublish?: () => void): Promise<void> {
     if (!active.release) {
       let resolveRelease: () => void = () => undefined;
       let rejectRelease: (error: unknown) => void = () => undefined;
@@ -462,6 +463,15 @@ export class SessionController {
         if (this.releasing === active.release) this.releasing = undefined;
       });
       this.releasing = active.release;
+      if (mode === "already-terminal") this.observeTerminalRelease(active, active.release);
+      let dispatchFailed = false;
+      let dispatchFailure: unknown;
+      try {
+        afterPublish?.();
+      } catch (error) {
+        dispatchFailed = true;
+        dispatchFailure = error;
+      }
 
       if (mode === "stop") active.retiringEvents = "stop";
       active.queuedFrames.length = 0;
@@ -503,6 +513,9 @@ export class SessionController {
         if (failure?.status === "rejected") rejectRelease(failure.reason);
         else resolveRelease();
       });
+      if (dispatchFailed) throw dispatchFailure;
+    } else {
+      afterPublish?.();
     }
     return active.release;
   }
