@@ -26,7 +26,7 @@ binary or require a GPU.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `VOICE_MODEL_PATH` | Yes | Multilingual Whisper weights (`.en` names rejected) |
+| `VOICE_MODEL_PATH` | Yes | Multilingual Whisper weights (`*.en.bin` / `*.en-*` basenames rejected) |
 | `VOICE_VAD_MODEL_PATH` | Yes | Silero VAD weights |
 | `VOICE_PORT` | Yes | Listen port |
 | `VOICE_MAX_SESSIONS` | Yes | Warm decoder pool size / admission capacity |
@@ -52,7 +52,8 @@ npm run fetch-models --workspace @voice/transcription-server -- --model medium
 
 Weights land in `models/` (gitignored). The fetcher always pulls Silero VAD
 alongside exactly one multilingual Whisper tier (`ggml-small.bin` or
-`ggml-medium.bin`). English-only `.en` names are rejected.
+`ggml-medium.bin`). English-only basenames matching `*.en.bin` / `*.en-*` are
+rejected.
 
 Pinned SHA-256 digests live in `test/fixtures/manifest.json`.
 
@@ -63,9 +64,10 @@ npm run build:native --workspace @voice/native-whisper-addon
 npm run build:cuda-image --workspace @voice/transcription-server
 ```
 
-Mount provisioned models and set `VOICE_MODEL_PATH`, `VOICE_VAD_MODEL_PATH`,
-`VOICE_ALLOWED_ORIGINS`, and `VOICE_AUTH_TOKEN`. `/health/ready` returns 200
-only after every decoder handle in the pool is warm.
+Mount provisioned models and set at least `VOICE_MODEL_PATH`,
+`VOICE_VAD_MODEL_PATH`, `VOICE_PORT`, `VOICE_MAX_SESSIONS`,
+`VOICE_ALLOWED_ORIGINS`, and `VOICE_AUTH_TOKEN` (when auth is on).
+`/health/ready` returns 200 only after every decoder handle in the pool is warm.
 
 Each leased native handle serializes decode calls (one in flight per handle).
 Final decodes take priority over coalesced provisional refreshes inside the

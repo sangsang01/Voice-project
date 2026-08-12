@@ -187,7 +187,13 @@ WASM toolchain.
 
 ### Environment and privacy
 
-- Browser: `VITE_TRANSCRIPTION_WS_URL`, optional `VITE_TRANSCRIPTION_TOKEN_URL`.
+- Browser: `VITE_TRANSCRIPTION_WS_URL`, optional `VITE_TRANSCRIPTION_TOKEN_URL`
+  (defaults to `/api/transcription-token`). The adapter always fetches
+  `{ token }` from that URL before `prepare()`; this repo does not ship the
+  endpoint. Local online development must serve a matching token JSON response
+  (and usually keep `VOICE_AUTH_TOKEN` equal to that token). `VOICE_REQUIRE_AUTH=0`
+  on loopback only disables server-side verification — it does not skip the
+  browser token fetch.
 - Server: `VOICE_MODEL_PATH`, `VOICE_VAD_MODEL_PATH`, `VOICE_PORT`,
   `VOICE_MAX_SESSIONS`, `VOICE_ALLOWED_ORIGINS`, `VOICE_AUTH_TOKEN` (when auth
   required), optional `VOICE_BIND_HOST`, `VOICE_REQUIRE_AUTH`, `VOICE_THREADS`,

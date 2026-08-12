@@ -59,7 +59,9 @@ Offline mode keeps the same frames inside the browser Worker.
 - Git with submodule support.
 - A current desktop Chromium browser (Chrome or Edge) with microphone access.
   Offline local also needs WebAssembly SIMD and cross-origin isolation.
-- For online real-time development: a running transcription server (fake or native).
+- For online real-time development: a running transcription server with a
+  provisioned multilingual model (native addon for real decode; ordinary unit
+  tests inject a fake runtime instead of loading `.node`).
 - For production GPU serving: CUDA-capable host/image, native addon build, and
   provisioned multilingual server models.
 - Docker, or Emscripten 6.0.6 on `PATH`, only when deliberately rebuilding the
@@ -116,7 +118,7 @@ and disables **Online real-time**.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `VOICE_MODEL_PATH` | Yes | Path to multilingual Whisper weights (names ending in `.en` are rejected) |
+| `VOICE_MODEL_PATH` | Yes | Path to multilingual Whisper weights (basenames matching `*.en.bin` / `*.en-*` are rejected) |
 | `VOICE_VAD_MODEL_PATH` | Yes | Path to Silero VAD weights |
 | `VOICE_PORT` | Yes | HTTP/WebSocket listen port |
 | `VOICE_MAX_SESSIONS` | Yes | Fixed warm decoder pool size / admission capacity |
@@ -147,7 +149,8 @@ npm run build:cuda-image --workspace @voice/transcription-server
 npm run benchmark --workspace @voice/transcription-server -- --model small
 ```
 
-English-only `.en` model names are prohibited. GPU tier selection (`small` vs
+English-only model basenames matching `*.en.bin` / `*.en-*` are prohibited. GPU
+tier selection (`small` vs
 `medium`) requires a real labeled benchmark on the reference GPU; until that
 comparison runs, no production model tier is accepted from this worktree. See
 `apps/transcription-server/README.md`.
@@ -162,10 +165,24 @@ npm run dev --workspace @voice/web
 
 Online real-time (loopback example): provision server models, build the native
 addon when you want real Whisper, set the server env vars above with
-`VOICE_BIND_HOST=127.0.0.1` and optionally `VOICE_REQUIRE_AUTH=0`, start the
-server, then start the web app with `VITE_TRANSCRIPTION_WS_URL` pointing at the
-loopback WebSocket URL. Ordinary unit tests inject a fake native runtime and do
-not load a `.node` binary.
+`VOICE_BIND_HOST=127.0.0.1`, start the server, then start the web app with
+`VITE_TRANSCRIPTION_WS_URL` pointing at the loopback WebSocket URL.
+
+The browser always fetches a short-lived token from
+`VITE_TRANSCRIPTION_TOKEN_URL` (default `/api/transcription-token`) before
+opening the socket. That endpoint is **not** shipped in this repo — for local
+online mode you must either:
+
+1. Keep auth enabled (`VOICE_REQUIRE_AUTH` unset/on), set matching
+   `VOICE_AUTH_TOKEN`, and serve a tiny token JSON endpoint that returns
+   `{ "token": "<same value>" }` (Vite middleware, reverse proxy, or a
+   one-line static handler), or
+2. Point `VITE_TRANSCRIPTION_TOKEN_URL` at whatever issues that JSON.
+
+Setting `VOICE_REQUIRE_AUTH=0` on loopback only skips **server** token
+verification; the web client still requires a successful token fetch, so
+option 1 or 2 remains necessary. Ordinary unit tests inject a fake native
+runtime and do not load a `.node` binary.
 
 Open the printed Vite URL, allow microphone access, select one to four candidate
 languages, choose **Online real-time** or **Offline local**, and click **Start**.
