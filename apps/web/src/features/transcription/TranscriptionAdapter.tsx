@@ -87,6 +87,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
     return () => window.clearInterval(clock);
   }, []);
 
+  const remoteAvailable = Boolean(import.meta.env.VITE_TRANSCRIPTION_WS_URL);
   const error = selectionError ?? localError ?? state.fatalError?.message;
   const preparing = !error && starting;
   const listening = !error && (state.engineState === "listening" || state.engineState === "draining");
@@ -126,7 +127,16 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
           <header className="console-title"><p>Voice console</p><h1>Earth Assistant</h1></header>
           <div aria-label="Candidate languages">{LANGUAGES.map(([tag, label]) => <button aria-pressed={candidateLanguages.includes(tag)} className="control-button" key={tag} onClick={() => toggleLanguage(tag)} type="button">{label}</button>)}</div>
           <div aria-label="Transcription mode">
-            <button aria-pressed={engineMode === "remote"} className="control-button" disabled={controlsLocked} onClick={() => void changeMode("remote")} type="button">Online real-time</button>
+            <button
+              aria-pressed={engineMode === "remote"}
+              className="control-button"
+              disabled={controlsLocked || !remoteAvailable}
+              onClick={() => void changeMode("remote")}
+              title={remoteAvailable ? undefined : "Configure VITE_TRANSCRIPTION_WS_URL to enable online real-time mode"}
+              type="button"
+            >
+              Online real-time
+            </button>
             <button aria-pressed={engineMode === "local"} className="control-button" disabled={controlsLocked} onClick={() => void changeMode("local")} type="button">Offline local</button>
           </div>
           <button className="control-button" disabled={controlsLocked} onClick={() => void run(() => controller.start(candidateLanguages))} type="button">Start</button>

@@ -224,6 +224,17 @@ async function selectEnglishAndStart(page: Page, timeout = 5_000) {
   await expect(page.getByRole("status")).toContainText("Listening", { timeout });
 }
 
+test("fake microphone starts and stops without loading a real model", async ({ page }) => {
+  await installBrowserFakes(page);
+  await page.goto("/");
+
+  await selectEnglishAndStart(page);
+  await page.getByRole("button", { name: "Stop" }).click();
+
+  await expect(page.getByRole("status")).toContainText("Standby");
+  await expect(page.locator(".transcript")).toContainText("synthetic final");
+});
+
 test("partial revisions replace one segment before final text", async ({ page }) => {
   await page.addInitScript(() => {
     type Listener = (event: MessageEvent<unknown>) => void;
@@ -264,48 +275,23 @@ test("partial revisions replace one segment before final text", async ({ page })
       public subscribe(listener: (event: Record<string, unknown>) => void) {
         this.listeners.add(listener);
         listener({ type: "state", sessionId: this.sessionId, sequence: 0, state: "listening" });
-        queueMicrotask(() => {
-          this.emit({
-            type: "segment.upsert",
-            segment: {
-              id: "booking",
-              ordinal: 0,
-              revision: 0,
-              startMs: 0,
-              endMs: 200,
-              text: "I would",
-              language: { tag: "en-US" },
-              isFinal: false,
-            },
-          });
-          this.emit({
-            type: "segment.upsert",
-            segment: {
-              id: "booking",
-              ordinal: 0,
-              revision: 1,
-              startMs: 0,
-              endMs: 400,
-              text: "I would like",
-              language: { tag: "en-US" },
-              isFinal: false,
-            },
-          });
-          this.emit({
-            type: "segment.upsert",
-            segment: {
-              id: "booking",
-              ordinal: 0,
-              revision: 2,
-              startMs: 0,
-              endMs: 800,
-              text: "I would like to reserve a room.",
-              language: { tag: "en-US" },
-              isFinal: true,
-            },
-          });
-        });
         return () => this.listeners.delete(listener);
+      }
+
+      public emitRevision(input: { text: string; revision: number; endMs: number; isFinal: boolean }) {
+        this.emit({
+          type: "segment.upsert",
+          segment: {
+            id: "booking",
+            ordinal: 0,
+            revision: input.revision,
+            startMs: 0,
+            endMs: input.endMs,
+            text: input.text,
+            language: { tag: "en-US" },
+            isFinal: input.isFinal,
+          },
+        });
       }
 
       private sequence = 0;
@@ -323,6 +309,8 @@ test("partial revisions replace one segment before final text", async ({ page })
       public async prepare() { return undefined; }
       public async open(request: { sessionId: string }) {
         this.session.sessionId = request.sessionId;
+        (window as Window & { __emitPartialRevision?: FakeRemoteSession["emitRevision"] }).__emitPartialRevision =
+          (input) => this.session.emitRevision(input);
         return this.session;
       }
       public async dispose() { return undefined; }
@@ -338,11 +326,30 @@ test("partial revisions replace one segment before final text", async ({ page })
   await selectEnglishAndStart(page);
 
   const segments = page.locator(".transcript p[data-final]");
+  const segmentText = page.locator(".transcript p[data-final] > span").first();
+
+  await page.evaluate(() => {
+    (window as Window & { __emitPartialRevision?: (input: { text: string; revision: number; endMs: number; isFinal: boolean }) => void })
+      .__emitPartialRevision?.({ text: "I would", revision: 0, endMs: 200, isFinal: false });
+  });
   await expect(segments).toHaveCount(1);
-  await expect(segments).toContainText("I would");
+  await expect(segments).toHaveAttribute("data-final", "false");
+  await expect(segmentText).toHaveText("I would");
+
+  await page.evaluate(() => {
+    (window as Window & { __emitPartialRevision?: (input: { text: string; revision: number; endMs: number; isFinal: boolean }) => void })
+      .__emitPartialRevision?.({ text: "I would like", revision: 1, endMs: 400, isFinal: false });
+  });
   await expect(segments).toHaveCount(1);
-  await expect(page.locator(".transcript")).toContainText("I would like to reserve a room.");
+  await expect(segmentText).toHaveText("I would like");
+  await expect(segments).toHaveAttribute("data-final", "false");
+
+  await page.evaluate(() => {
+    (window as Window & { __emitPartialRevision?: (input: { text: string; revision: number; endMs: number; isFinal: boolean }) => void })
+      .__emitPartialRevision?.({ text: "I would like to reserve a room.", revision: 2, endMs: 800, isFinal: true });
+  });
   await expect(segments).toHaveCount(1);
+  await expect(segmentText).toHaveText("I would like to reserve a room.");
   await expect(segments).toHaveAttribute("data-final", "true");
   await expect(page.getByRole("status")).toContainText("Listening");
 

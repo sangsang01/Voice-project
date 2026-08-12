@@ -327,24 +327,81 @@ describe("TranscriptionAdapter", () => {
     vi.unstubAllEnvs();
   });
 
-  it("lets the mode control switch to Offline local and rebuilds the engine", async () => {
+  it("disables Online real-time when no WebSocket URL is configured", () => {
+    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "");
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} microphoneFactory={async () => ({ stop: vi.fn(async () => undefined) })} />);
+    expect(screen.getByRole("button", { name: "Online real-time" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Offline local" })).toHaveAttribute("aria-pressed", "true");
+    vi.unstubAllEnvs();
+  });
+
+  it("evicts a cached remote engine when switching to Offline local", async () => {
     vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "wss://transcription.example/ws");
     defaultLocalEngine.created = 0;
     defaultRemoteEngine.created = 0;
-    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
-    defaultLocalEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
+    defaultRemoteEngine.dispose.mockClear();
+    defaultLocalEngine.dispose.mockClear();
+
+    const remoteListeners = new Set<(event: EngineEvent) => void>();
+    let remoteSessionId = "remote-session";
+    const remoteSession = {
+      push: vi.fn(() => ({ accepted: true as const })),
+      stop: vi.fn(async () => {
+        for (const listener of remoteListeners) {
+          listener({ type: "state", sessionId: remoteSessionId, sequence: 1, state: "stopped" });
+        }
+      }),
+      cancel: vi.fn(async () => undefined),
+      subscribe: vi.fn((listener: (event: EngineEvent) => void) => {
+        remoteListeners.add(listener);
+        listener({ type: "state", sessionId: remoteSessionId, sequence: 0, state: "listening" });
+        return () => remoteListeners.delete(listener);
+      }),
+    };
     defaultRemoteEngine.inspect.mockResolvedValue({ available: true });
-    defaultRemoteEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
+    defaultRemoteEngine.prepare.mockResolvedValue(undefined);
+    defaultRemoteEngine.open.mockImplementation(async (request?: SessionRequest) => {
+      remoteSessionId = request?.sessionId ?? "remote-session";
+      return remoteSession;
+    });
+    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
+    defaultLocalEngine.prepare.mockResolvedValue(undefined);
+    defaultLocalEngine.open.mockImplementation(async (request?: SessionRequest) => {
+      const localSessionId = request?.sessionId ?? "local-session";
+      const localListeners = new Set<(event: EngineEvent) => void>();
+      return {
+        push: vi.fn(() => ({ accepted: true as const })),
+        stop: vi.fn(async () => {
+          for (const listener of localListeners) {
+            listener({ type: "state", sessionId: localSessionId, sequence: 1, state: "stopped" });
+          }
+        }),
+        cancel: vi.fn(async () => undefined),
+        subscribe: vi.fn((listener: (event: EngineEvent) => void) => {
+          localListeners.add(listener);
+          listener({ type: "state", sessionId: localSessionId, sequence: 0, state: "listening" });
+          return () => localListeners.delete(listener);
+        }),
+      };
+    });
 
     render(<TranscriptionAdapter initialLanguages={["en-US"]} microphoneFactory={async () => ({ stop: vi.fn(async () => undefined) })} />);
 
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultRemoteEngine.created).toBe(1));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Listening"));
+    expect(defaultLocalEngine.created).toBe(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Standby"));
+
     fireEvent.click(screen.getByRole("button", { name: "Offline local" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Offline local" })).toHaveAttribute("aria-pressed", "true"));
-    expect(screen.getByRole("button", { name: "Online real-time" })).toHaveAttribute("aria-pressed", "false");
+    await waitFor(() => expect(defaultRemoteEngine.dispose).toHaveBeenCalled());
 
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(defaultLocalEngine.created).toBe(1));
-    expect(defaultRemoteEngine.created).toBe(0);
+    expect(defaultRemoteEngine.created).toBe(1);
     vi.unstubAllEnvs();
   });
 
