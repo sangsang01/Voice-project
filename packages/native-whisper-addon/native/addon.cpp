@@ -2,6 +2,7 @@
 
 #include "whisper.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -33,14 +34,15 @@ struct DecodeResult {
   int32_t endMs = 0;
 };
 
-DecodeResult runFull(
+bool runFull(
     whisper_context * ctx,
     const std::vector<float> & samples,
     const std::string & prompt,
-    int threads) {
-  DecodeResult result;
+    int threads,
+    DecodeResult & result) {
+  result = DecodeResult{};
   if (ctx == nullptr || samples.empty()) {
-    return result;
+    return false;
   }
 
   whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
@@ -58,7 +60,7 @@ DecodeResult runFull(
   params.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
 
   if (whisper_full(ctx, params, samples.data(), static_cast<int>(samples.size())) != 0) {
-    return result;
+    return false;
   }
 
   const int n = whisper_full_n_segments(ctx);
@@ -77,15 +79,11 @@ DecodeResult runFull(
     }
   }
 
-  if (n > 0) {
-    // Segment times are in centiseconds even when timestamp tokens are disabled.
-    result.startMs = static_cast<int32_t>(whisper_full_get_segment_t0(ctx, 0) * 10);
-    result.endMs = static_cast<int32_t>(whisper_full_get_segment_t1(ctx, n - 1) * 10);
-  } else {
-    result.endMs = static_cast<int32_t>((samples.size() * 1000) / kSampleRate);
-  }
-
-  return result;
+  // With no_timestamps, segment t0/t1 are not reliable window times (often a
+  // full 30s encoder chunk). Report the provided PCM window duration instead.
+  result.startMs = 0;
+  result.endMs = static_cast<int32_t>((samples.size() * 1000) / kSampleRate);
+  return true;
 }
 
 class WhisperRuntimeWrap : public Napi::ObjectWrap<WhisperRuntimeWrap> {
@@ -153,7 +151,10 @@ public:
     carry_.reserve(kVadWindowSamples);
   }
 
-  ~WhisperRuntimeWrap() override { CloseInternal(); }
+  ~WhisperRuntimeWrap() override {
+    closed_.store(true, std::memory_order_release);
+    FreeContexts();
+  }
 
 private:
   static Napi::FunctionReference constructor;
@@ -171,9 +172,14 @@ private:
           samples_(std::move(samples)),
           prompt_(std::move(prompt)) {
       runtime_->Ref();
+      runtime_->inflight_.fetch_add(1, std::memory_order_acq_rel);
     }
 
-    ~DecodeWorker() override { runtime_->Unref(); }
+    ~DecodeWorker() override {
+      runtime_->inflight_.fetch_sub(1, std::memory_order_acq_rel);
+      runtime_->MaybeFreeAfterClose();
+      runtime_->Unref();
+    }
 
     Napi::Promise Promise() { return deferred_.Promise(); }
 
@@ -185,11 +191,13 @@ private:
       }
 
       std::lock_guard<std::mutex> lock(runtime_->mutex_);
-      if (runtime_->closed_ || runtime_->ctx_ == nullptr) {
+      if (runtime_->closed_.load(std::memory_order_acquire) || runtime_->ctx_ == nullptr) {
         SetError("Native whisper runtime is closed");
         return;
       }
-      result_ = runFull(runtime_->ctx_, pcm, prompt_, runtime_->threads_);
+      if (!runFull(runtime_->ctx_, pcm, prompt_, runtime_->threads_, result_)) {
+        SetError("whisper_full failed");
+      }
     }
 
     void OnOK() override {
@@ -219,20 +227,28 @@ private:
           deferred_(Napi::Promise::Deferred::New(env)),
           runtime_(runtime) {
       runtime_->Ref();
+      runtime_->inflight_.fetch_add(1, std::memory_order_acq_rel);
     }
 
-    ~WarmupWorker() override { runtime_->Unref(); }
+    ~WarmupWorker() override {
+      runtime_->inflight_.fetch_sub(1, std::memory_order_acq_rel);
+      runtime_->MaybeFreeAfterClose();
+      runtime_->Unref();
+    }
 
     Napi::Promise Promise() { return deferred_.Promise(); }
 
     void Execute() override {
       std::vector<float> silence(kWarmupSamples, 0.0f);
+      DecodeResult ignored;
       std::lock_guard<std::mutex> lock(runtime_->mutex_);
-      if (runtime_->closed_ || runtime_->ctx_ == nullptr) {
+      if (runtime_->closed_.load(std::memory_order_acquire) || runtime_->ctx_ == nullptr) {
         SetError("Native whisper runtime is closed");
         return;
       }
-      (void)runFull(runtime_->ctx_, silence, "", runtime_->threads_);
+      if (!runFull(runtime_->ctx_, silence, "", runtime_->threads_, ignored)) {
+        SetError("whisper warmup failed");
+      }
     }
 
     void OnOK() override { deferred_.Resolve(Env().Undefined()); }
@@ -244,13 +260,20 @@ private:
     WhisperRuntimeWrap * runtime_;
   };
 
+  static bool IsInt16Array(const Napi::Value & value) {
+    if (!value.IsTypedArray()) {
+      return false;
+    }
+    return value.As<Napi::TypedArray>().TypedArrayType() == napi_int16_array;
+  }
+
   Napi::Value PushVad(const Napi::CallbackInfo & info) {
     Napi::Env env = info.Env();
-    if (closed_ || vctx_ == nullptr) {
+    if (closed_.load(std::memory_order_acquire) || vctx_ == nullptr) {
       Napi::Error::New(env, "Native whisper runtime is closed").ThrowAsJavaScriptException();
       return env.Null();
     }
-    if (info.Length() < 1 || !info[0].IsTypedArray()) {
+    if (info.Length() < 1 || !IsInt16Array(info[0])) {
       Napi::TypeError::New(env, "pushVad expects an Int16Array").ThrowAsJavaScriptException();
       return env.Null();
     }
@@ -284,11 +307,11 @@ private:
 
   Napi::Value Decode(const Napi::CallbackInfo & info) {
     Napi::Env env = info.Env();
-    if (closed_) {
+    if (closed_.load(std::memory_order_acquire)) {
       Napi::Error::New(env, "Native whisper runtime is closed").ThrowAsJavaScriptException();
       return env.Null();
     }
-    if (info.Length() < 2 || !info[0].IsTypedArray() || !info[1].IsString()) {
+    if (info.Length() < 2 || !IsInt16Array(info[0]) || !info[1].IsString()) {
       Napi::TypeError::New(env, "decode expects (Int16Array, string)").ThrowAsJavaScriptException();
       return env.Null();
     }
@@ -306,7 +329,7 @@ private:
 
   Napi::Value Warmup(const Napi::CallbackInfo & info) {
     Napi::Env env = info.Env();
-    if (closed_) {
+    if (closed_.load(std::memory_order_acquire)) {
       Napi::Error::New(env, "Native whisper runtime is closed").ThrowAsJavaScriptException();
       return env.Null();
     }
@@ -327,16 +350,26 @@ private:
   }
 
   Napi::Value Close(const Napi::CallbackInfo & info) {
-    CloseInternal();
+    // Mark closed immediately so Task 9 timeout recycle does not block the
+    // Node event loop on an in-flight whisper_full. Contexts free when the
+    // last worker exits (or synchronously if none are running).
+    closed_.store(true, std::memory_order_release);
+    MaybeFreeAfterClose();
     return info.Env().Undefined();
   }
 
-  void CloseInternal() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (closed_) {
+  void MaybeFreeAfterClose() {
+    if (!closed_.load(std::memory_order_acquire)) {
       return;
     }
-    closed_ = true;
+    if (inflight_.load(std::memory_order_acquire) != 0) {
+      return;
+    }
+    FreeContexts();
+  }
+
+  void FreeContexts() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (vctx_ != nullptr) {
       whisper_vad_free(vctx_);
       vctx_ = nullptr;
@@ -354,8 +387,9 @@ private:
   std::vector<float> floatBuffer_;
   std::vector<float> carry_;
   std::mutex mutex_;
+  std::atomic<int> inflight_{0};
+  std::atomic<bool> closed_{false};
   int threads_ = 1;
-  bool closed_ = false;
 };
 
 Napi::FunctionReference WhisperRuntimeWrap::constructor;
