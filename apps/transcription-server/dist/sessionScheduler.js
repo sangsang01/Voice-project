@@ -64,7 +64,7 @@ export class SessionScheduler {
         this.stoppingPromise = new Promise((resolve) => {
             this.resolveStop = resolve;
         });
-        if (this.speaking || this.frames.length > 0) {
+        if (this.speaking) {
             this.speaking = false;
             this.requestFinal();
         }

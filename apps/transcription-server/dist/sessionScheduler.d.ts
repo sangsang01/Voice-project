@@ -4,6 +4,7 @@ export interface SessionSchedulerOptions {
     request: SessionRequest;
     runtime: StreamingRuntimeSession;
     emit(event: EngineEvent): void;
+    /** Reserved for a later task's metrics/timestamping; unused by this scheduler. */
     now?: () => number;
     setTimer?: typeof setTimeout;
     clearTimer?: typeof clearTimeout;

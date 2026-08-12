@@ -305,6 +305,55 @@ describe("SessionScheduler", () => {
     expect(fake.decodeCalls).toHaveLength(0);
   });
 
+  it("does not finalize on stop when pushed audio never crossed the speech threshold", async () => {
+    const clock = createManualClock();
+    const fake = createFakeRuntime();
+    const events: EngineEvent[] = [];
+    const scheduler = new SessionScheduler({
+      request: makeSessionRequest(["en-US"]),
+      runtime: fake.runtime,
+      emit: (event) => events.push(event),
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    // Frames arrive (buffered) but the VAD never reports speech.
+    fake.queueVadUpdate({ speechStarted: false, speechEnded: false });
+    scheduler.push(makeFrame(0));
+
+    await expect(scheduler.stop()).resolves.toBeUndefined();
+    expect(fake.decodeCalls).toHaveLength(0);
+    expect(events.filter((event) => event.type === "segment.upsert")).toHaveLength(0);
+  });
+
+  it("does not emit a second phantom final when stop is called after an utterance already finalized", async () => {
+    const clock = createManualClock();
+    const fake = createFakeRuntime();
+    const events: EngineEvent[] = [];
+    const scheduler = new SessionScheduler({
+      request: makeSessionRequest(["en-US"]),
+      runtime: fake.runtime,
+      emit: (event) => events.push(event),
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    fake.queueVadUpdate({ speechStarted: true, speechEnded: false });
+    scheduler.push(makeFrame(0));
+    fake.queueVadUpdate({ speechStarted: false, speechEnded: true });
+    scheduler.push(makeFrame(1));
+    fake.resolveOldest(result("hello"));
+    await flush();
+
+    expect(events.filter((event) => event.type === "segment.upsert")).toHaveLength(1);
+
+    // The overlap tail retained by finishUtterance() must not be re-flushed.
+    await expect(scheduler.stop()).resolves.toBeUndefined();
+    expect(events.filter((event) => event.type === "segment.upsert")).toHaveLength(1);
+  });
+
   it("emits no segment after cancellation even if a decode was already in flight", async () => {
     const clock = createManualClock();
     const fake = createFakeRuntime();

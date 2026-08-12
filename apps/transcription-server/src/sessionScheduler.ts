@@ -7,6 +7,7 @@ export interface SessionSchedulerOptions {
   request: SessionRequest;
   runtime: StreamingRuntimeSession;
   emit(event: EngineEvent): void;
+  /** Reserved for a later task's metrics/timestamping; unused by this scheduler. */
   now?: () => number;
   setTimer?: typeof setTimeout;
   clearTimer?: typeof clearTimeout;
@@ -83,7 +84,7 @@ export class SessionScheduler {
     this.stoppingPromise = new Promise((resolve) => {
       this.resolveStop = resolve;
     });
-    if (this.speaking || this.frames.length > 0) {
+    if (this.speaking) {
       this.speaking = false;
       this.requestFinal();
     }
