@@ -1,0 +1,5 @@
+# Keep local model weights and benchmark output out of the Docker build context.
+**/node_modules
+apps/transcription-server/models
+apps/transcription-server/benchmark-results
+**/.git

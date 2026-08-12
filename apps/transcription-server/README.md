@@ -34,10 +34,17 @@ npm run benchmark --workspace @voice/transcription-server -- --model small
 ```
 
 Hard gates (P95): first partial ≤1500 ms, refresh ≤1000 ms, final-after-silence
-≤1500 ms, real-time factor <0.5 at four concurrent sessions. Quantized vs
-unquantized accuracy is compared with `--compare baseline.json candidate.json`
-and rejects aggregate WER/CER regressions above one absolute point (or any
-language above two points).
+≤1500 ms, **decoder** real-time factor <0.5 at four concurrent sessions.
+RTF is `sum(decodeDurationMs) / sum(audioDurationMs)` from server metrics
+(`VOICE_METRICS_PATH` JSONL), not paced client wall clock. Point the benchmark
+at the same metrics file with `--metrics <path>` (or the env var). Missing
+latency/decode samples fail gates instead of passing as zero.
+
+Quantized vs unquantized accuracy is compared with
+`--compare baseline.json candidate.json` and rejects aggregate WER/CER
+regressions above one absolute point (or any language above two points).
+Accuracy selection requires real labeled fixtures; sine placeholders are not
+sufficient to accept a production tier.
 
 ## Model selection (GPU)
 

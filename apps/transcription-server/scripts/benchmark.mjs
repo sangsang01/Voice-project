@@ -36,6 +36,7 @@ function parseArgs(argv) {
     origin: DEFAULT_ORIGIN,
     token: DEFAULT_TOKEN,
     outDir: join(packageRoot, "benchmark-results"),
+    metricsPath: process.env.VOICE_METRICS_PATH ?? null,
     compare: null,
     save: true,
   };
@@ -47,6 +48,7 @@ function parseArgs(argv) {
     else if (arg === "--origin") args.origin = argv[++i];
     else if (arg === "--token") args.token = argv[++i];
     else if (arg === "--out-dir") args.outDir = argv[++i];
+    else if (arg === "--metrics") args.metricsPath = argv[++i];
     else if (arg === "--no-save") args.save = false;
     else if (arg === "--compare") {
       args.compare = [argv[++i], argv[++i]];
@@ -56,7 +58,7 @@ function parseArgs(argv) {
 }
 
 function percentile(sorted, p) {
-  if (sorted.length === 0) return 0;
+  if (sorted.length === 0) return Number.POSITIVE_INFINITY;
   const index = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
   return sorted[Math.max(0, index)];
 }
@@ -319,18 +321,21 @@ async function runSession(socket, sessionSpec, audioFrames) {
 
 export function evaluateGates(report, gates = manifest.gates) {
   const failures = [];
-  if (!(report.firstPartialP95Ms <= gates.firstPartialP95Ms)) {
+  if (!Number.isFinite(report.firstPartialP95Ms) || !(report.firstPartialP95Ms <= gates.firstPartialP95Ms)) {
     failures.push(`firstPartialP95Ms ${report.firstPartialP95Ms} > ${gates.firstPartialP95Ms}`);
   }
-  if (!(report.refreshP95Ms <= gates.refreshP95Ms)) {
+  if (!Number.isFinite(report.refreshP95Ms) || !(report.refreshP95Ms <= gates.refreshP95Ms)) {
     failures.push(`refreshP95Ms ${report.refreshP95Ms} > ${gates.refreshP95Ms}`);
   }
-  if (!(report.finalAfterSilenceP95Ms <= gates.finalAfterSilenceP95Ms)) {
+  if (
+    !Number.isFinite(report.finalAfterSilenceP95Ms) ||
+    !(report.finalAfterSilenceP95Ms <= gates.finalAfterSilenceP95Ms)
+  ) {
     failures.push(
       `finalAfterSilenceP95Ms ${report.finalAfterSilenceP95Ms} > ${gates.finalAfterSilenceP95Ms}`,
     );
   }
-  if (!(report.realTimeFactor < gates.realTimeFactor)) {
+  if (!Number.isFinite(report.realTimeFactor) || !(report.realTimeFactor < gates.realTimeFactor)) {
     failures.push(`realTimeFactor ${report.realTimeFactor} >= ${gates.realTimeFactor}`);
   }
   return failures;
@@ -386,7 +391,28 @@ export function compareAccuracy(baseline, candidate, limits = manifest.accuracyR
   return failures;
 }
 
-function buildReport(model, sessionMetrics) {
+function readDecodeMetrics(metricsPath) {
+  if (!metricsPath || !existsSync(metricsPath)) return [];
+  return readFileSync(metricsPath, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((row) => typeof row.decodeDurationMs === "number" && typeof row.audioDurationMs === "number");
+}
+
+/** Decoder RTF = total decode compute time / total audio duration (not paced wall clock). */
+export function computeRealTimeFactor(decodeMetrics) {
+  if (!Array.isArray(decodeMetrics) || decodeMetrics.length === 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const decodeMs = decodeMetrics.reduce((sum, row) => sum + row.decodeDurationMs, 0);
+  const audioMs = decodeMetrics.reduce((sum, row) => sum + row.audioDurationMs, 0);
+  if (!(audioMs > 0)) return Number.POSITIVE_INFINITY;
+  return Number((decodeMs / audioMs).toFixed(4));
+}
+
+function buildReport(model, sessionMetrics, decodeMetrics = []) {
   const firstPartials = sessionMetrics
     .map((s) => s.firstPartialMs)
     .filter((v) => typeof v === "number")
@@ -398,16 +424,6 @@ function buildReport(model, sessionMetrics) {
     .map((s) => s.finalAfterSilenceMs)
     .filter((v) => typeof v === "number")
     .sort((a, b) => a - b);
-
-  const audioMs = Math.max(...sessionMetrics.map((s) => s.audioDurationMs), 1);
-  const wallMs = Math.max(
-    ...sessionMetrics.map((s) => (s.finalAfterSilenceMs ?? 0) + (s.firstPartialMs ?? 0)),
-    audioMs,
-  );
-  // Concurrent sessions share wall clock; RTF = decode/wait wall vs longest audio.
-  const started = Math.min(...sessionMetrics.map(() => 0));
-  void started;
-  const concurrentWallMs = Math.max(...sessionMetrics.map((s) => s.audioDurationMs + (s.finalAfterSilenceMs ?? 0)));
 
   const werByLanguage = {};
   const cerByLanguage = {};
@@ -422,7 +438,7 @@ function buildReport(model, sessionMetrics) {
     firstPartialP95Ms: Number(percentile(firstPartials, 95).toFixed(2)),
     refreshP95Ms: Number(percentile(refreshes, 95).toFixed(2)),
     finalAfterSilenceP95Ms: Number(percentile(finals, 95).toFixed(2)),
-    realTimeFactor: Number((concurrentWallMs / audioMs).toFixed(4)),
+    realTimeFactor: computeRealTimeFactor(decodeMetrics),
     sessions: sessionMetrics.length,
     model,
     werByLanguage,
@@ -439,15 +455,11 @@ async function runBenchmark(args) {
   const sockets = sessions.map(() => connect(args.url, args));
   await Promise.all(sockets.map(waitOpen));
 
-  const wallStart = performance.now();
   const results = await Promise.all(
     sessions.map((spec, index) => runSession(sockets[index], spec, loadSessionAudio(spec))),
   );
-  const wallMs = performance.now() - wallStart;
-  const report = buildReport(args.model, results);
-  // Prefer measured concurrent wall clock for RTF.
-  const maxAudio = Math.max(...results.map((r) => r.audioDurationMs));
-  report.realTimeFactor = Number((wallMs / maxAudio).toFixed(4));
+  const decodeMetrics = readDecodeMetrics(args.metricsPath);
+  const report = buildReport(args.model, results, decodeMetrics);
 
   for (const socket of sockets) {
     try {

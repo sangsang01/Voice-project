@@ -8,11 +8,13 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { appendFileSync } from "node:fs";
 import { basename } from "node:path";
 
 import { loadNativeWhisperAddon } from "@voice/native-whisper-addon";
 
 import { createTranscriptionGateway } from "./gateway.js";
+import { JsonLinesMetricsSink } from "./metrics.js";
 import { RuntimePool } from "./runtimePool.js";
 
 export interface ServerEnv {
@@ -93,11 +95,20 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     handleHttpRequest(request, response, () => ready);
   });
 
+  const metricsPath = env.VOICE_METRICS_PATH?.trim();
+  const metrics =
+    metricsPath && metricsPath.length > 0
+      ? new JsonLinesMetricsSink((line) => {
+          appendFileSync(metricsPath, line, "utf8");
+        })
+      : undefined;
+
   const closeGateway = createTranscriptionGateway({
     server,
     runtime: pool,
     capacity,
     allowedOrigins: config.allowedOrigins,
+    metrics,
     authenticate(token) {
       if (!config.requireAuth) {
         return { accountId: "anonymous" };
