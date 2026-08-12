@@ -180,8 +180,9 @@ online mode you must either:
 2. Point `VITE_TRANSCRIPTION_TOKEN_URL` at whatever issues that JSON.
 
 Setting `VOICE_REQUIRE_AUTH=0` on loopback only skips **server** token
-verification; the web client still requires a successful token fetch, so
-option 1 or 2 remains necessary. Ordinary unit tests inject a fake native
+verification. The web client still needs a successful `{ "token": "..." }`
+fetch (any non-empty string when auth is off; the same value as
+`VOICE_AUTH_TOKEN` when auth is on). Ordinary unit tests inject a fake native
 runtime and do not load a `.node` binary.
 
 Open the printed Vite URL, allow microphone access, select one to four candidate
