@@ -192,13 +192,13 @@ function waitOpen(socket) {
 async function runSession(socket, sessionSpec, audioFrames) {
   const sessionId = `${sessionSpec.id}-${randomUUID()}`;
   const metrics = {
+    sessionId,
     language: sessionSpec.language,
     referenceText: sessionSpec.referenceText,
     firstPartialMs: null,
     refreshIntervalsMs: [],
     finalAfterSilenceMs: null,
     audioDurationMs: audioFrames.length * FRAME_MS,
-    decodeDurationsMs: [],
     finalText: "",
     transcriptStartedAt: null,
     silenceStartedAt: null,
@@ -391,14 +391,22 @@ export function compareAccuracy(baseline, candidate, limits = manifest.accuracyR
   return failures;
 }
 
-function readDecodeMetrics(metricsPath) {
+export function resetMetricsFile(metricsPath) {
+  if (!metricsPath) return;
+  mkdirSync(dirname(metricsPath), { recursive: true });
+  writeFileSync(metricsPath, "", "utf8");
+}
+
+export function readDecodeMetrics(metricsPath, sessionIds = null) {
   if (!metricsPath || !existsSync(metricsPath)) return [];
+  const allowed = sessionIds ? new Set(sessionIds) : null;
   return readFileSync(metricsPath, "utf8")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => JSON.parse(line))
-    .filter((row) => typeof row.decodeDurationMs === "number" && typeof row.audioDurationMs === "number");
+    .filter((row) => typeof row.decodeDurationMs === "number" && typeof row.audioDurationMs === "number")
+    .filter((row) => !allowed || allowed.has(row.sessionId));
 }
 
 /** Decoder RTF = total decode compute time / total audio duration (not paced wall clock). */
@@ -452,13 +460,19 @@ async function runBenchmark(args) {
     throw new Error("manifest must define exactly four benchmarkSessions");
   }
 
+  // Isolate RTF samples to this run: truncate metrics file, then filter by session IDs.
+  resetMetricsFile(args.metricsPath);
+
   const sockets = sessions.map(() => connect(args.url, args));
   await Promise.all(sockets.map(waitOpen));
 
   const results = await Promise.all(
     sessions.map((spec, index) => runSession(sockets[index], spec, loadSessionAudio(spec))),
   );
-  const decodeMetrics = readDecodeMetrics(args.metricsPath);
+  const decodeMetrics = readDecodeMetrics(
+    args.metricsPath,
+    results.map((result) => result.sessionId),
+  );
   const report = buildReport(args.model, results, decodeMetrics);
 
   for (const socket of sockets) {
