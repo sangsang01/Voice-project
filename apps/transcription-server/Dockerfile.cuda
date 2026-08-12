@@ -1,0 +1,100 @@
+# syntax=docker/dockerfile:1.7
+# Multi-stage CUDA production image for the native Whisper transcription server.
+# Build from repo root via: npm run build:cuda-image --workspace @voice/transcription-server
+#
+# Digests are registry manifest-list pins (linux/amd64 resolves at pull time).
+
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:da6791294b0b04d7e65d87b7451d6f2390b4d36225ab0701ee7dfec5769829f5
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.4.1-runtime-ubuntu22.04@sha256:517da2300c184c9999ec203c2665244bdebd3578d12fcc7065e83667932643d9
+ARG NODE_VERSION=22.14.0
+
+FROM ${CUDA_DEVEL_IMAGE} AS build
+
+ARG NODE_VERSION
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      xz-utils \
+      python3 \
+      make \
+      g++ \
+      cmake \
+      git \
+    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+      | tar -xJ -C /usr/local --strip-components=1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY package.json package-lock.json ./
+COPY apps/transcription-server/package.json apps/transcription-server/
+COPY apps/web/package.json apps/web/
+COPY packages/transcription-contracts/package.json packages/transcription-contracts/
+COPY packages/streaming-protocol/package.json packages/streaming-protocol/
+COPY packages/native-whisper-addon/package.json packages/native-whisper-addon/
+COPY packages/local-whisper-engine/package.json packages/local-whisper-engine/
+COPY packages/remote-whisper-engine/package.json packages/remote-whisper-engine/
+COPY scripts/fetch-models.mjs scripts/fetch-models.mjs
+
+# Skip browser model postinstall during image build; server models mount at runtime.
+RUN npm pkg delete scripts.postinstall \
+  && npm ci --ignore-scripts
+
+COPY tsconfig.base.json ./
+COPY packages/transcription-contracts packages/transcription-contracts
+COPY packages/streaming-protocol packages/streaming-protocol
+COPY packages/native-whisper-addon packages/native-whisper-addon
+COPY apps/transcription-server apps/transcription-server
+COPY vendor/whisper.cpp vendor/whisper.cpp
+
+RUN npm run build --workspace @voice/transcription-contracts \
+  && npm run build --workspace @voice/streaming-protocol \
+  && npm run build --workspace @voice/native-whisper-addon \
+  && npm run build --workspace @voice/transcription-server \
+  && cd packages/native-whisper-addon \
+  && npx cmake-js compile -T native-whisper-addon -B Release --CDGGML_CUDA=ON \
+  && cd /src \
+  && npm prune --omit=dev --workspaces --if-present
+
+FROM ${CUDA_RUNTIME_IMAGE} AS runtime
+
+ARG NODE_VERSION
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      xz-utils \
+      libgomp1 \
+    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+      | tar -xJ -C /usr/local --strip-components=1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 voice \
+    && useradd --system --uid 10001 --gid voice --create-home --home-dir /home/voice voice
+
+WORKDIR /app
+COPY --from=build /src/package.json /src/package-lock.json ./
+COPY --from=build /src/node_modules ./node_modules
+COPY --from=build /src/packages/transcription-contracts/package.json ./packages/transcription-contracts/
+COPY --from=build /src/packages/transcription-contracts/dist ./packages/transcription-contracts/dist
+COPY --from=build /src/packages/streaming-protocol/package.json ./packages/streaming-protocol/
+COPY --from=build /src/packages/streaming-protocol/dist ./packages/streaming-protocol/dist
+COPY --from=build /src/packages/native-whisper-addon/package.json ./packages/native-whisper-addon/
+COPY --from=build /src/packages/native-whisper-addon/dist ./packages/native-whisper-addon/dist
+COPY --from=build /src/packages/native-whisper-addon/build/Release/native-whisper-addon.node \
+  ./packages/native-whisper-addon/build/Release/native-whisper-addon.node
+COPY --from=build /src/apps/transcription-server/package.json ./apps/transcription-server/
+COPY --from=build /src/apps/transcription-server/dist ./apps/transcription-server/dist
+
+ENV NODE_ENV=production \
+    VOICE_PORT=8787 \
+    VOICE_BIND_HOST=0.0.0.0 \
+    VOICE_MAX_SESSIONS=4 \
+    VOICE_USE_GPU=1 \
+    VOICE_THREADS=4
+
+USER voice
+EXPOSE 8787
+HEALTHCHECK --interval=10s --timeout=3s --start-period=120s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8787/health/ready || exit 1
+
+CMD ["node", "apps/transcription-server/dist/main.js"]

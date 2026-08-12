@@ -2,7 +2,12 @@
  * Production entrypoint: load the native whisper addon, warm a fixed decoder
  * pool, and serve authenticated WebSocket transcription sessions.
  */
-import { createServer, type Server } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import { basename } from "node:path";
 
 import { loadNativeWhisperAddon } from "@voice/native-whisper-addon";
@@ -70,6 +75,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   // Design default concurrency is four warm decoders; operators size via VOICE_MAX_SESSIONS.
   const capacity = config.maxSessions;
 
+  let ready = false;
   const pool = await RuntimePool.create({
     modelName: modelNameFromPath(config.modelPath),
     capacity,
@@ -81,9 +87,10 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
         useGpu,
       }),
   });
+  ready = true;
 
-  const server = createServer((_request, response) => {
-    response.writeHead(404).end();
+  const server = createServer((request, response) => {
+    handleHttpRequest(request, response, () => ready);
   });
 
   const closeGateway = createTranscriptionGateway({
@@ -112,6 +119,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   const shutdown = async (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    ready = false;
     console.error(`shutting down on ${signal}`);
     try {
       pool.stopAdmission();
@@ -135,9 +143,29 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   );
 }
 
+/** HTTP readiness: 200 only after every warm pool handle is available. */
+export function handleHttpRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  isReady: () => boolean,
+): void {
+  const url = new URL(request.url ?? "/", "http://127.0.0.1");
+  if (request.method === "GET" && url.pathname === "/health/ready") {
+    if (isReady()) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ready: true }));
+      return;
+    }
+    response.writeHead(503, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ready: false }));
+    return;
+  }
+  response.writeHead(404).end();
+}
+
 export function assertMultilingualModel(modelPath: string): void {
   const name = basename(modelPath);
-  if (/\.en(?:\.|$)/i.test(name)) {
+  if (/\.en(?:[.\-]|$)/i.test(name)) {
     throw new Error("VOICE_MODEL_PATH must reference a multilingual model");
   }
 }
