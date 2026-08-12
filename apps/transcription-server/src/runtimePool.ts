@@ -124,8 +124,9 @@ export class RuntimePool implements StreamingRuntime {
         if (replacement) this.closeHandleOnce(replacement);
         // Preserve capacity: try one more replacement so a transient warmup
         // failure does not permanently shrink the pool.
+        let retry: NativeRuntimeHandle | undefined;
         try {
-          const retry = this.createHandle();
+          retry = this.createHandle();
           await retry.warmup();
           if (this.shuttingDown) {
             this.closeHandleOnce(retry);
@@ -133,6 +134,7 @@ export class RuntimePool implements StreamingRuntime {
           }
           this.idle.push(retry);
         } catch (retryError) {
+          if (retry) this.closeHandleOnce(retry);
           throw retryError instanceof Error ? retryError : error;
         }
       }
