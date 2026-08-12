@@ -1,48 +1,67 @@
-# Browser-only multilingual transcription
+# Multilingual transcription (online real-time + offline local)
 
-This app transcribes live microphone audio in a recent desktop Chromium browser.
-It supports Vietnamese (`vi-VN`), English (`en-US`), Spanish (`es-ES`), and
-Chinese (`zh-CN`) and keeps speech in its original language.
+This app transcribes live microphone audio for Vietnamese (`vi-VN`), English
+(`en-US`), Spanish (`es-ES`), and Chinese (`zh-CN`) and keeps speech in its
+original language. It supports two explicit modes:
 
-There is one transcription engine: [whisper.cpp v1.9.2](https://github.com/ggml-org/whisper.cpp)
-compiled to WebAssembly, with Silero VAD v6.2.0 deciding when an utterance is
-ready to transcribe. The engine runs in a Web Worker. Microphone audio and
-transcript text stay in the browser; there is no transcription server or
-runtime upload path.
+```text
+Online real-time: microphone -> WSS -> native GPU Whisper -> revisions -> browser
+Offline local:    microphone -> browser Worker -> WASM Whisper -> final-only browser text
+```
 
-Model weights are downloaded during `npm install`, served by the web app from
-its own origin, and cached with the browser Cache API. A transcription session
-does not fetch models from a third-party host.
+**Online real-time** is the default when `VITE_TRANSCRIPTION_WS_URL` is set. Audio
+leaves the device over authenticated WebSocket TLS; the server runs whisper.cpp
+with Silero VAD, emits provisional segment revisions while you speak, and
+finalizes after trailing silence. Audio and transcripts stay in memory for the
+session and are not persisted by default.
+
+**Offline local** keeps microphone audio and transcript text in the browser. It
+uses whisper.cpp v1.9.2 compiled to WebAssembly plus Silero VAD v6.2.0 in a Web
+Worker, and emits final-only segments (no rolling provisional revisions).
+
+Browser WASM model weights are downloaded during `npm install`, served from the
+app's own origin, and cached with the Cache API. A local transcription session
+does not fetch models from a third-party host. Server GPU model weights are
+provisioned separately (see below).
 
 ## Architecture
 
 ```text
 apps/web/
-  React/Vite UI, microphone capture, 16 kHz PCM framing, and session state
+  React/Vite UI, microphone capture, 16 kHz PCM framing, mode selection, session state
 packages/transcription-contracts/
   Shared TypeScript engine/session contracts and validators
+packages/streaming-protocol/
+  voice-transcription.v1 wire schemas and 656-byte PCM codec
+packages/remote-whisper-engine/
+  Browser WebSocket TranscriptionEngine for online real-time mode
 packages/local-whisper-engine/
   Worker controller, Silero VAD gate, language mapping, and C++/WASM bridge
   wasm/
     Committed whisper.cpp bridge build output used by the browser
+packages/native-whisper-addon/
+  N-API loader + native whisper.cpp/Silero runtime for the server
+apps/transcription-server/
+  WSS gateway, admission, session scheduler, decoder pool, metrics
 scripts/fetch-models.mjs
-  Install-time, checksum-verified model download into apps/web/public/models/
+  Install-time, checksum-verified browser model download into apps/web/public/models/
 vendor/whisper.cpp/
   Git submodule pinned to whisper.cpp v1.9.2
 ```
 
-The microphone produces 20 ms frames of 16 kHz mono PCM. The worker converts
-them to float32, groups them into Silero's 512-sample windows, and turns the
-speech probabilities into utterance boundaries. Completed utterances go
-through the whisper.cpp WASM bridge, which emits final transcript segments and
-one detected language per utterance.
+The microphone always produces 20 ms frames of 16 kHz mono PCM (320 samples).
+Online mode encodes each frame as a fixed 656-byte binary WebSocket message.
+Offline mode keeps the same frames inside the browser Worker.
 
 ## Prerequisites
 
 - Node.js 20.19+, 22.12+, or 24+, and npm.
 - Git with submodule support.
-- A current desktop Chromium browser (Chrome or Edge) with microphone access,
-  WebAssembly SIMD, and cross-origin isolation.
+- A current desktop Chromium browser (Chrome or Edge) with microphone access.
+  Offline local also needs WebAssembly SIMD and cross-origin isolation.
+- For online real-time development: a running transcription server (fake or native).
+- For production GPU serving: CUDA-capable host/image, native addon build, and
+  provisioned multilingual server models.
 - Docker, or Emscripten 6.0.6 on `PATH`, only when deliberately rebuilding the
   committed WASM artifacts.
 
@@ -64,59 +83,134 @@ git submodule update --init --recursive
 npm install
 ```
 
-`npm install` runs the model fetcher through `postinstall`. It downloads about
-32 MB of weights into the gitignored `apps/web/public/models/` directory:
+`npm install` runs the browser model fetcher through `postinstall`. It downloads
+about 32 MB of weights into the gitignored `apps/web/public/models/` directory:
 
 | File | Purpose | Approximate size |
 | --- | --- | ---: |
-| `ggml-tiny-q5_1.bin` | Quantized multilingual Whisper model | 31 MB |
+| `ggml-tiny-q5_1.bin` | Quantized multilingual Whisper model (offline local) | 31 MB |
 | `ggml-silero-v6.2.0.bin` | Silero VAD v6.2.0 | 885 kB |
 
 Downloads are checked against pinned SHA-256 hashes. Re-run the fetch manually
 with `npm run fetch-models`; already-valid files are reused.
 
+Root `npm run build` compiles workspaces in a fixed order so a clean checkout
+never depends on stale generated declarations: contracts → streaming-protocol →
+local-whisper-engine → remote-whisper-engine → native-whisper-addon (TypeScript
+loader only) → transcription-server → web. Ordinary builds do **not** compile
+the native C++ addon or require a GPU.
+
+## Modes and environment
+
+### Online real-time (browser)
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `VITE_TRANSCRIPTION_WS_URL` | Yes for online mode | WebSocket endpoint (`wss:` in production; `ws://127.0.0.1:...` only for loopback development) |
+| `VITE_TRANSCRIPTION_TOKEN_URL` | No | Token endpoint; defaults to `/api/transcription-token` |
+
+When `VITE_TRANSCRIPTION_WS_URL` is unset, the UI defaults to **Offline local**
+and disables **Online real-time**.
+
+### Transcription server
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `VOICE_MODEL_PATH` | Yes | Path to multilingual Whisper weights (names ending in `.en` are rejected) |
+| `VOICE_VAD_MODEL_PATH` | Yes | Path to Silero VAD weights |
+| `VOICE_PORT` | Yes | HTTP/WebSocket listen port |
+| `VOICE_MAX_SESSIONS` | Yes | Fixed warm decoder pool size / admission capacity |
+| `VOICE_ALLOWED_ORIGINS` | Yes | Comma-separated browser origin allowlist |
+| `VOICE_AUTH_TOKEN` | Yes when auth is required | Shared bearer token compared to the client token |
+| `VOICE_BIND_HOST` | No | Defaults to `0.0.0.0`; use `127.0.0.1` for loopback development |
+| `VOICE_REQUIRE_AUTH` | No | Defaults on; set `0` only with loopback bind |
+| `VOICE_THREADS` | No | Native decode threads (default `4`) |
+| `VOICE_USE_GPU` | No | Defaults on; set `0` to force CPU |
+| `VOICE_METRICS_PATH` | No | Append-only JSONL metrics sink (no audio/transcript content) |
+
+Production accepts authenticated `wss:` connections with an origin allowlist.
+Development may use unauthenticated `ws:` only when bound to loopback
+(`127.0.0.1` / `::1` / `localhost`); non-loopback unauthenticated binding is
+refused. Audio and transcripts remain in memory and are released when the
+session ends. Persistence is disabled by default. Logs and metrics use opaque
+session IDs, timings, sizes, model version, and error codes only.
+
+### Server models and native build
+
+```bash
+npm run fetch-models --workspace @voice/transcription-server -- --model small
+# or
+npm run fetch-models --workspace @voice/transcription-server -- --model medium
+
+npm run build:native --workspace @voice/native-whisper-addon
+npm run build:cuda-image --workspace @voice/transcription-server
+npm run benchmark --workspace @voice/transcription-server -- --model small
+```
+
+English-only `.en` model names are prohibited. GPU tier selection (`small` vs
+`medium`) requires a real labeled benchmark on the reference GPU; until that
+comparison runs, no production model tier is accepted from this worktree. See
+`apps/transcription-server/README.md`.
+
 ## Run locally
+
+Offline local only:
 
 ```bash
 npm run dev --workspace @voice/web
 ```
 
+Online real-time (loopback example): provision server models, build the native
+addon when you want real Whisper, set the server env vars above with
+`VOICE_BIND_HOST=127.0.0.1` and optionally `VOICE_REQUIRE_AUTH=0`, start the
+server, then start the web app with `VITE_TRANSCRIPTION_WS_URL` pointing at the
+loopback WebSocket URL. Ordinary unit tests inject a fake native runtime and do
+not load a `.node` binary.
+
 Open the printed Vite URL, allow microphone access, select one to four candidate
-languages, and click **Start**. Vite's development server supplies the required
-cross-origin-isolation headers.
+languages, choose **Online real-time** or **Offline local**, and click **Start**.
+Vite's development server supplies the cross-origin-isolation headers needed for
+offline WASM.
+
+## Client scope
+
+The first client is the responsive web app on desktop browsers and iPhone Safari
+while the page is in the foreground. Background mobile capture is not promised.
+A future thin iOS companion may expose a Siri / App Intents entry point such as
+"Start live transcript"; that remains a future entry point and is not
+implemented in this repository.
 
 ## Production hosting
 
-Build the static web app with:
+Build with:
 
 ```bash
 npm run build
 ```
 
 Deploy `apps/web/dist/` on a host that sends both headers on the document and
-application assets:
+application assets (required for offline local WASM / `SharedArrayBuffer`):
 
 ```http
 Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-The WASM build uses pthread support and therefore requires
-`SharedArrayBuffer`, which Chromium exposes only to a cross-origin-isolated
-page. With `Cross-Origin-Embedder-Policy: require-corp`, any cross-origin assets
-you add must also opt in through CORS or an appropriate
-`Cross-Origin-Resource-Policy` header. Without isolation the app reports that
-local transcription is unavailable.
+Serve the transcription server behind TLS so browsers use `wss:`. Keep
+`VOICE_ALLOWED_ORIGINS` and short-lived session tokens aligned with the web
+origin. With `Cross-Origin-Embedder-Policy: require-corp`, any cross-origin
+assets you add must also opt in through CORS or an appropriate
+`Cross-Origin-Resource-Policy` header.
 
 ## Commands
 
 Run these from the repository root:
 
 ```bash
-npm install                                    # install all workspaces and fetch models
-npm run fetch-models                           # verify/fetch the two model files
+npm install                                    # install all workspaces and fetch browser models
+npm run fetch-models                           # verify/fetch browser model files
 npm run dev --workspace @voice/web             # start the browser app
-npm run build                                  # build every workspace
+npm run build                                  # build every workspace in explicit order
 npm test                                       # build, then test every workspace
 npm run typecheck                              # build, then typecheck every workspace
 npm run lint                                   # lint workspaces that define a lint script
@@ -148,8 +242,10 @@ git add vendor/whisper.cpp packages/local-whisper-engine/wasm
 git commit -m "chore: update whisper.cpp to <new-tag>"
 ```
 
-The local rebuild command requires Emscripten 6.0.6. If it is unavailable,
-reproduce the build with the pinned container image.
+Do not patch `vendor/whisper.cpp` for the server path; native glue lives under
+`packages/native-whisper-addon/`. The local WASM rebuild command requires
+Emscripten 6.0.6. If it is unavailable, reproduce the build with the pinned
+container image.
 
 Bash:
 
@@ -173,12 +269,12 @@ install, test, or application work.
 
 ## Known limitations
 
-- The quantized `tiny` model favors download size and speed over accuracy,
-  especially for accented speech, Vietnamese, and Chinese.
-- Inference is CPU WebAssembly with no GPU acceleration. The runtime currently
-  invokes the bridge with one inference thread because nested Chromium pthread
-  inference stalled in real browser testing; slower devices can have noticeable
-  latency.
+- Online mode sends audio off-device; use TLS, origin allowlisting, tokens, and
+  the no-persistence policy. Offline mode keeps audio in the browser.
+- The offline quantized `tiny` model favors download size and speed over
+  accuracy, especially for accented speech, Vietnamese, and Chinese.
+- Offline inference is CPU WebAssembly with no GPU acceleration and currently
+  one inference thread after real Chromium pthread stalls.
 - Whisper reports one language per utterance, not per word. Code-switching
   inside one utterance is not identified precisely, and speech outside the
   selected candidate languages is labeled `und`.
@@ -186,7 +282,7 @@ install, test, or application work.
   pauses, and very quiet speech can merge, split, or miss utterances.
 - An uninterrupted utterance is force-split at 25 seconds to stay below
   Whisper's 30-second encoder window.
-- Microphone capture requires browser permission, and the shipped build targets
-  current desktop Chromium rather than every browser or mobile device.
+- iPhone Safari support is foreground-only; Siri/App Intents is a future entry
+  point only.
 - This app is not a safety-, medical-, legal-, or accessibility-critical
   transcription guarantee.

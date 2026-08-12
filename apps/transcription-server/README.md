@@ -1,7 +1,46 @@
 # Transcription server
 
-Native GPU Whisper service with WebSocket streaming, fixed decoder pool, and
-checksum-verified model provisioning.
+Native GPU Whisper service with WebSocket streaming
+(`voice-transcription.v1`), fixed decoder pool, and checksum-verified model
+provisioning. This is the **Online real-time** backend:
+
+```text
+microphone -> WSS -> native GPU Whisper -> revisions -> browser
+```
+
+Ordinary unit tests inject a **fake runtime** and never load a native `.node`
+binary or require a GPU.
+
+## Protocol invariants
+
+- Subprotocol: `voice-transcription.v1`.
+- **One active session per socket.** A second `session.start` is rejected.
+- Binary PCM messages are exactly **656 bytes** (see
+  `@voice/streaming-protocol`).
+- Servers emit `audio.ack` with `throughSequence` so clients can apply
+  credit-based backpressure.
+- Engine results are forwarded as `engine.event` using the shared
+  `EngineEvent` contract (provisional revisions, then immutable finals).
+
+## Environment
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `VOICE_MODEL_PATH` | Yes | Multilingual Whisper weights (`.en` names rejected) |
+| `VOICE_VAD_MODEL_PATH` | Yes | Silero VAD weights |
+| `VOICE_PORT` | Yes | Listen port |
+| `VOICE_MAX_SESSIONS` | Yes | Warm decoder pool size / admission capacity |
+| `VOICE_ALLOWED_ORIGINS` | Yes | Comma-separated origin allowlist |
+| `VOICE_AUTH_TOKEN` | Yes when auth on | Bearer token expected from clients |
+| `VOICE_BIND_HOST` | No | Default `0.0.0.0`; use `127.0.0.1` for loopback |
+| `VOICE_REQUIRE_AUTH` | No | Default on; `0` only allowed with loopback bind |
+| `VOICE_THREADS` | No | Native threads (default `4`) |
+| `VOICE_USE_GPU` | No | Default on; `0` forces CPU |
+| `VOICE_METRICS_PATH` | No | JSONL metrics path (no audio/transcript content) |
+
+Production: authenticated `wss:` plus origin allowlist. Development: plaintext
+`ws:` and `VOICE_REQUIRE_AUTH=0` only when bound to loopback. Audio and
+transcripts stay in memory for the session; persistence is disabled by default.
 
 ## Models
 
@@ -17,15 +56,20 @@ alongside exactly one multilingual Whisper tier (`ggml-small.bin` or
 
 Pinned SHA-256 digests live in `test/fixtures/manifest.json`.
 
-## CUDA image
+## Native addon and CUDA image
 
 ```bash
+npm run build:native --workspace @voice/native-whisper-addon
 npm run build:cuda-image --workspace @voice/transcription-server
 ```
 
 Mount provisioned models and set `VOICE_MODEL_PATH`, `VOICE_VAD_MODEL_PATH`,
 `VOICE_ALLOWED_ORIGINS`, and `VOICE_AUTH_TOKEN`. `/health/ready` returns 200
 only after every decoder handle in the pool is warm.
+
+Each leased native handle serializes decode calls (one in flight per handle).
+Final decodes take priority over coalesced provisional refreshes inside the
+session scheduler.
 
 ## Benchmark gates
 
@@ -53,3 +97,13 @@ Reference GPU comparison (CUDA image, four-session fixture, `small` then
 (`dockerDesktopLinuxEngine` pipe missing) even though an NVIDIA GPU was present.
 No benchmark-results were fabricated. Until the comparison is executed on the
 reference GPU, **no production model tier is accepted** from this worktree.
+
+## Run
+
+```bash
+npm run build --workspace @voice/transcription-server
+npm run dev --workspace @voice/transcription-server
+```
+
+`dev` executes `node dist/main.js` after the TypeScript build. For real Whisper,
+build the native addon and point `VOICE_*` paths at provisioned models first.

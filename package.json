@@ -3,7 +3,7 @@
   "private": true,
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
+    "build": "npm run build --workspace @voice/transcription-contracts && npm run build --workspace @voice/streaming-protocol && npm run build --workspace @voice/local-whisper-engine && npm run build --workspace @voice/remote-whisper-engine && npm run build --workspace @voice/native-whisper-addon && npm run build --workspace @voice/transcription-server && npm run build --workspace @voice/web",
     "test": "npm run build && npm run test --workspaces --if-present",
     "typecheck": "npm run build && npm run typecheck --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
