@@ -224,15 +224,131 @@ async function selectEnglishAndStart(page: Page, timeout = 5_000) {
   await expect(page.getByRole("status")).toContainText("Listening", { timeout });
 }
 
-test("fake microphone starts and stops without loading a real model", async ({ page }) => {
-  await installBrowserFakes(page);
+test("partial revisions replace one segment before final text", async ({ page }) => {
+  await page.addInitScript(() => {
+    type Listener = (event: MessageEvent<unknown>) => void;
+
+    class FakeNode {
+      public connect() { return this; }
+      public disconnect() { /* Browser cleanup is intentionally harmless in the fake graph. */ }
+    }
+
+    class FakeAudioWorkletNode extends FakeNode {
+      public port: { onmessage: Listener | null } = { onmessage: null };
+      public constructor() { super(); }
+    }
+
+    class FakeAudioContext {
+      public audioWorklet = { addModule: async () => undefined };
+      public destination = new FakeNode();
+      public async resume() { /* no-op */ }
+      public async close() { /* no-op */ }
+      public createMediaStreamSource() { return new FakeNode(); }
+    }
+
+    Object.defineProperty(window, "AudioContext", { configurable: true, value: FakeAudioContext });
+    Object.defineProperty(window, "AudioWorkletNode", { configurable: true, value: FakeAudioWorkletNode });
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: async () => ({ getTracks: () => [{ stop() { /* no-op */ } }] }) },
+    });
+
+    class FakeRemoteSession {
+      private readonly listeners = new Set<(event: Record<string, unknown>) => void>();
+      public sessionId = "remote-session";
+      public readonly stop = async () => {
+        this.emit({ type: "state", state: "stopped" });
+      };
+      public readonly cancel = async () => undefined;
+      public push() { return { accepted: true as const }; }
+      public subscribe(listener: (event: Record<string, unknown>) => void) {
+        this.listeners.add(listener);
+        listener({ type: "state", sessionId: this.sessionId, sequence: 0, state: "listening" });
+        queueMicrotask(() => {
+          this.emit({
+            type: "segment.upsert",
+            segment: {
+              id: "booking",
+              ordinal: 0,
+              revision: 0,
+              startMs: 0,
+              endMs: 200,
+              text: "I would",
+              language: { tag: "en-US" },
+              isFinal: false,
+            },
+          });
+          this.emit({
+            type: "segment.upsert",
+            segment: {
+              id: "booking",
+              ordinal: 0,
+              revision: 1,
+              startMs: 0,
+              endMs: 400,
+              text: "I would like",
+              language: { tag: "en-US" },
+              isFinal: false,
+            },
+          });
+          this.emit({
+            type: "segment.upsert",
+            segment: {
+              id: "booking",
+              ordinal: 0,
+              revision: 2,
+              startMs: 0,
+              endMs: 800,
+              text: "I would like to reserve a room.",
+              language: { tag: "en-US" },
+              isFinal: true,
+            },
+          });
+        });
+        return () => this.listeners.delete(listener);
+      }
+
+      private sequence = 0;
+      private emit(event: Record<string, unknown>) {
+        this.sequence += 1;
+        for (const listener of this.listeners) {
+          listener({ ...event, sessionId: this.sessionId, sequence: this.sequence });
+        }
+      }
+    }
+
+    class FakeRemoteEngine {
+      public readonly session = new FakeRemoteSession();
+      public async inspect() { return { available: true }; }
+      public async prepare() { return undefined; }
+      public async open(request: { sessionId: string }) {
+        this.session.sessionId = request.sessionId;
+        return this.session;
+      }
+      public async dispose() { return undefined; }
+    }
+
+    Object.defineProperty(window, "__transcriptionEngineFactory", {
+      configurable: true,
+      value: () => new FakeRemoteEngine(),
+    });
+  });
+
   await page.goto("/");
-
   await selectEnglishAndStart(page);
-  await page.getByRole("button", { name: "Stop" }).click();
 
+  const segments = page.locator(".transcript p[data-final]");
+  await expect(segments).toHaveCount(1);
+  await expect(segments).toContainText("I would");
+  await expect(segments).toHaveCount(1);
+  await expect(page.locator(".transcript")).toContainText("I would like to reserve a room.");
+  await expect(segments).toHaveCount(1);
+  await expect(segments).toHaveAttribute("data-final", "true");
+  await expect(page.getByRole("status")).toContainText("Listening");
+
+  await page.getByRole("button", { name: "Stop" }).click();
   await expect(page.getByRole("status")).toContainText("Standby");
-  await expect(page.getByText("synthetic final")).toBeVisible();
+  await expect(page.locator(".transcript")).toContainText("I would like to reserve a room.");
 });
 
 test("rapid clear and restart drops stale transcript events", async ({ page }) => {

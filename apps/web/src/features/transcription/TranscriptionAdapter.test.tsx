@@ -20,6 +20,15 @@ const defaultLocalEngine = vi.hoisted(() => ({
   dispose: vi.fn(async () => undefined),
 }));
 
+const defaultRemoteEngine = vi.hoisted(() => ({
+  created: 0,
+  options: [] as Array<{ endpoint: string; tokenProvider?: () => Promise<string> | string }>,
+  inspect: vi.fn(async () => ({ available: true })),
+  prepare: vi.fn(async () => undefined),
+  open: vi.fn(),
+  dispose: vi.fn(async () => undefined),
+}));
+
 vi.mock("@voice/local-whisper-engine", () => ({
   LocalWhisperEngine: class {
     public readonly inspect = defaultLocalEngine.inspect;
@@ -31,6 +40,20 @@ vi.mock("@voice/local-whisper-engine", () => ({
       defaultLocalEngine.created += 1;
       defaultLocalEngine.onProgress = options.onProgress;
       defaultLocalEngine.onProgressCallbacks.push(options.onProgress);
+    }
+  },
+}));
+
+vi.mock("@voice/remote-whisper-engine", () => ({
+  RemoteWhisperEngine: class {
+    public readonly inspect = defaultRemoteEngine.inspect;
+    public readonly prepare = defaultRemoteEngine.prepare;
+    public readonly open = defaultRemoteEngine.open;
+    public readonly dispose = defaultRemoteEngine.dispose;
+
+    public constructor(options: { endpoint: string; tokenProvider?: () => Promise<string> | string }) {
+      defaultRemoteEngine.created += 1;
+      defaultRemoteEngine.options.push(options);
     }
   },
 }));
@@ -280,6 +303,51 @@ describe("TranscriptionAdapter", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Standby");
   });
 
+  it("defaults to RemoteWhisperEngine and Online real-time when the websocket URL is configured", async () => {
+    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "wss://transcription.example/ws");
+    defaultLocalEngine.created = 0;
+    defaultRemoteEngine.created = 0;
+    defaultRemoteEngine.options = [];
+    defaultRemoteEngine.inspect.mockResolvedValue({ available: true });
+    defaultRemoteEngine.prepare.mockResolvedValue(undefined);
+    defaultRemoteEngine.open.mockImplementation(async () => {
+      throw new Error("open should not be required for this construction check");
+    });
+    defaultRemoteEngine.dispose.mockResolvedValue(undefined);
+
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} microphoneFactory={async () => ({ stop: vi.fn(async () => undefined) })} />);
+
+    expect(screen.getByRole("button", { name: "Online real-time" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Offline local" })).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultRemoteEngine.created).toBe(1));
+    expect(defaultRemoteEngine.options[0]?.endpoint).toBe("wss://transcription.example/ws");
+    expect(defaultLocalEngine.created).toBe(0);
+    vi.unstubAllEnvs();
+  });
+
+  it("lets the mode control switch to Offline local and rebuilds the engine", async () => {
+    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "wss://transcription.example/ws");
+    defaultLocalEngine.created = 0;
+    defaultRemoteEngine.created = 0;
+    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
+    defaultLocalEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
+    defaultRemoteEngine.inspect.mockResolvedValue({ available: true });
+    defaultRemoteEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
+
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} microphoneFactory={async () => ({ stop: vi.fn(async () => undefined) })} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Offline local" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Offline local" })).toHaveAttribute("aria-pressed", "true"));
+    expect(screen.getByRole("button", { name: "Online real-time" })).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultLocalEngine.created).toBe(1));
+    expect(defaultRemoteEngine.created).toBe(0);
+    vi.unstubAllEnvs();
+  });
+
   it("renders provisional and final segments with language badges and model progress", async () => {
     const { engine } = renderAdapter();
     fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
@@ -294,15 +362,33 @@ describe("TranscriptionAdapter", () => {
         id: "s1", ordinal: 1, revision: 1, startMs: 0, endMs: 200, text: "Hello", language: { tag: "en-US" }, isFinal: false,
       },
     });
+
+    const provisional = await screen.findByText("Hello");
+    const provisionalSegment = provisional.closest("p");
+    expect(provisionalSegment).toHaveClass("transcript-segment--provisional");
+    expect(provisionalSegment).toHaveAttribute("data-final", "false");
+    expect(provisionalSegment).toHaveTextContent("Updating");
+    expect(document.querySelector(".transcript")).toHaveAttribute("aria-live", "off");
+    const politeRegion = document.querySelector(".visually-hidden[aria-live='polite']");
+    expect(politeRegion).not.toBeNull();
+    expect(politeRegion).not.toHaveTextContent("Hello");
+
     engine.session.emit({
       type: "segment.upsert", sequence: 3, segment: {
         id: "s1", ordinal: 1, revision: 2, startMs: 0, endMs: 300, text: "Hello world", language: { tag: "en-US" }, isFinal: true,
       },
     });
 
-    expect(await screen.findByText("Hello world")).toBeInTheDocument();
-    expect(screen.getByText("en-US")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(document.querySelectorAll(".transcript p[data-final='true']")).toHaveLength(1);
+    });
+    const finalSegment = document.querySelector(".transcript p[data-final='true']");
+    expect(finalSegment).toHaveTextContent("Hello world");
+    expect(finalSegment).toHaveTextContent("en-US");
+    expect(finalSegment).not.toHaveClass("transcript-segment--provisional");
     expect(screen.getByRole("status")).toHaveTextContent("Listening");
+    expect(screen.getAllByText("Hello world")).toHaveLength(2);
+    expect(politeRegion).toHaveTextContent("Hello world");
   });
 
   it("warns on backpressure and ignores stale events after clear and restart", async () => {
@@ -313,7 +399,7 @@ describe("TranscriptionAdapter", () => {
     await waitFor(() => expect(engine.open).toHaveBeenCalled());
     engine.session.rejectNextFrame = true;
     emitFrame(frame(0));
-    expect(await screen.findByText(/Audio is arriving faster/)).toBeInTheDocument();
+    expect(await screen.findByText(/Audio is arriving faster than the transcription service/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Clear & Restart" }));
     await waitFor(() => expect(engine.session.cancel).toHaveBeenCalled());
