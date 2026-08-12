@@ -1,8 +1,15 @@
 /**
- * Production entrypoint stub for Task 6.
- * Native runtime pooling is wired in a later task; this process still validates
- * required configuration and fails closed when production values are missing.
+ * Production entrypoint: load the native whisper addon, warm a fixed decoder
+ * pool, and serve authenticated WebSocket transcription sessions.
  */
+import { createServer, type Server } from "node:http";
+import { basename } from "node:path";
+
+import { loadNativeWhisperAddon } from "@voice/native-whisper-addon";
+
+import { createTranscriptionGateway } from "./gateway.js";
+import { RuntimePool } from "./runtimePool.js";
+
 export interface ServerEnv {
   modelPath: string;
   vadModelPath: string;
@@ -35,6 +42,8 @@ export function loadServerEnv(env: NodeJS.ProcessEnv = process.env): ServerEnv {
     throw new Error("unauthenticated mode is only allowed when bound to loopback");
   }
 
+  assertMultilingualModel(modelPath);
+
   return {
     modelPath,
     vadModelPath,
@@ -48,12 +57,82 @@ export function loadServerEnv(env: NodeJS.ProcessEnv = process.env): ServerEnv {
 
 export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const config = loadServerEnv(env);
-  // Native StreamingRuntime is provided by a later task. Fail explicitly so
-  // operators do not start an empty gateway that accepts sockets without models.
-  throw new Error(
-    `transcription server configuration is valid (model=${config.modelPath}, port=${config.port}), ` +
-      "but the native runtime is not wired yet",
+  const addon = loadNativeWhisperAddon();
+  const threads = parsePositiveInt(env.VOICE_THREADS ?? "4", "VOICE_THREADS");
+  const useGpu = env.VOICE_USE_GPU !== "0";
+  // Design default concurrency is four warm decoders; operators size via VOICE_MAX_SESSIONS.
+  const capacity = config.maxSessions;
+
+  const pool = await RuntimePool.create({
+    modelName: modelNameFromPath(config.modelPath),
+    capacity,
+    createHandle: () =>
+      addon.createRuntime({
+        modelPath: config.modelPath,
+        vadModelPath: config.vadModelPath,
+        threads,
+        useGpu,
+      }),
+  });
+
+  const server = createServer((_request, response) => {
+    response.writeHead(404).end();
+  });
+
+  const closeGateway = createTranscriptionGateway({
+    server,
+    runtime: pool,
+    capacity,
+    allowedOrigins: config.allowedOrigins,
+    authenticate(token) {
+      if (!config.requireAuth) {
+        return { accountId: "anonymous" };
+      }
+      if (typeof token !== "string" || token.length === 0) {
+        throw new Error("missing access token");
+      }
+      const expected = env.VOICE_AUTH_TOKEN;
+      if (typeof expected === "string" && expected.length > 0 && token !== expected) {
+        throw new Error("invalid access token");
+      }
+      return { accountId: `account-${token.slice(0, 16)}` };
+    },
+  });
+
+  await listen(server, config.port, config.bindHost);
+
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`shutting down on ${signal}`);
+    pool.stopAdmission();
+    closeGateway();
+    await pool.shutdown({ drainTimeoutMs: 10_000 });
+    await closeHttpServer(server);
+  };
+
+  process.once("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+  process.once("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+
+  console.error(
+    `transcription server listening on ${config.bindHost}:${config.port} model=${config.modelPath} capacity=${capacity}`,
   );
+}
+
+export function assertMultilingualModel(modelPath: string): void {
+  const name = basename(modelPath);
+  if (/\.en(?:\.|$)/i.test(name)) {
+    throw new Error("VOICE_MODEL_PATH must reference a multilingual model");
+  }
+}
+
+function modelNameFromPath(modelPath: string): string {
+  return basename(modelPath).replace(/^ggml-/, "").replace(/\.bin$/i, "") || "whisper";
 }
 
 function required(value: string | undefined, name: string): string {
@@ -87,6 +166,25 @@ function isLoopbackHost(host: string): boolean {
     normalized === "::1" ||
     normalized === "0:0:0:0:0:0:0:1"
   );
+}
+
+function listen(server: Server, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function closeHttpServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
 }
 
 const entry = process.argv[1];

@@ -5,4 +5,6 @@ export * from "./sessionScheduler.js";
 export * from "./admission.js";
 export * from "./gateway.js";
 export * from "./metrics.js";
-export { loadServerEnv, main, type ServerEnv } from "./main.js";
+export * from "./nativeRuntime.js";
+export * from "./runtimePool.js";
+export { loadServerEnv, main, assertMultilingualModel, type ServerEnv } from "./main.js";

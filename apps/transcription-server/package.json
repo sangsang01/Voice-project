@@ -8,10 +8,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
+    "test:native": "vitest run test/nativeSmoke.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit --pretty false",
     "dev": "node dist/main.js"
   },
   "dependencies": {
+    "@voice/native-whisper-addon": "0.0.0",
     "@voice/streaming-protocol": "0.0.0",
     "@voice/transcription-contracts": "0.0.0",
     "ws": "^8.21.3"
