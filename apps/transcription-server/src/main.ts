@@ -44,6 +44,13 @@ export function loadServerEnv(env: NodeJS.ProcessEnv = process.env): ServerEnv {
 
   assertMultilingualModel(modelPath);
 
+  if (requireAuth) {
+    const authToken = env.VOICE_AUTH_TOKEN;
+    if (typeof authToken !== "string" || authToken.trim().length === 0) {
+      throw new Error("missing required production configuration: VOICE_AUTH_TOKEN");
+    }
+  }
+
   return {
     modelPath,
     vadModelPath,
@@ -91,8 +98,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
       if (typeof token !== "string" || token.length === 0) {
         throw new Error("missing access token");
       }
-      const expected = env.VOICE_AUTH_TOKEN;
-      if (typeof expected === "string" && expected.length > 0 && token !== expected) {
+      const expected = required(env.VOICE_AUTH_TOKEN, "VOICE_AUTH_TOKEN");
+      if (token !== expected) {
         throw new Error("invalid access token");
       }
       return { accountId: `account-${token.slice(0, 16)}` };
@@ -106,10 +113,14 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     if (shuttingDown) return;
     shuttingDown = true;
     console.error(`shutting down on ${signal}`);
-    pool.stopAdmission();
-    closeGateway();
-    await pool.shutdown({ drainTimeoutMs: 10_000 });
-    await closeHttpServer(server);
+    try {
+      pool.stopAdmission();
+      closeGateway();
+      await pool.shutdown({ drainTimeoutMs: 10_000 });
+      await closeHttpServer(server);
+    } finally {
+      process.exit(0);
+    }
   };
 
   process.once("SIGINT", () => {

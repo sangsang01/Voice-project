@@ -111,13 +111,31 @@ export class RuntimePool implements StreamingRuntime {
       }
 
       this.closeHandleOnce(handle);
-      const replacement = this.createHandle();
-      await replacement.warmup();
-      if (this.shuttingDown) {
-        this.closeHandleOnce(replacement);
-        return;
+      let replacement: NativeRuntimeHandle | undefined;
+      try {
+        replacement = this.createHandle();
+        await replacement.warmup();
+        if (this.shuttingDown) {
+          this.closeHandleOnce(replacement);
+          return;
+        }
+        this.idle.push(replacement);
+      } catch (error) {
+        if (replacement) this.closeHandleOnce(replacement);
+        // Preserve capacity: try one more replacement so a transient warmup
+        // failure does not permanently shrink the pool.
+        try {
+          const retry = this.createHandle();
+          await retry.warmup();
+          if (this.shuttingDown) {
+            this.closeHandleOnce(retry);
+            return;
+          }
+          this.idle.push(retry);
+        } catch (retryError) {
+          throw retryError instanceof Error ? retryError : error;
+        }
       }
-      this.idle.push(replacement);
     } finally {
       this.notifyDrainWaiters();
     }

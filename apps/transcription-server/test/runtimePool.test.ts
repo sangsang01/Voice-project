@@ -255,4 +255,54 @@ describe("RuntimePool", () => {
     expect(ended).toBe(true);
     await session.close();
   });
+
+  it("rejects further decode after a timeout without starting another native call", async () => {
+    const tracker = createTracker();
+    const pool = await createPool(tracker, { capacity: 1, decodeTimeoutMs: 20 });
+    const session = await pool.open(makeSessionRequest(["en-US"]));
+    const handle = tracker.handles[0]!;
+    handle.decodeImpl = () => new Promise(() => undefined);
+
+    await expect(session.decode("provisional", new Int16Array(320), "")).rejects.toThrow(/timeout/i);
+    const started = tracker.decodeStarts.length;
+    await expect(session.decode("final", new Int16Array(320), "")).rejects.toThrow(/closed/i);
+    expect(tracker.decodeStarts.length).toBe(started);
+
+    await session.close();
+    const replacement = await pool.open(makeSessionRequest(["en-US"]));
+    expect(tracker.created).toBe(2);
+    await replacement.close();
+  });
+
+  it("retries handle replacement so a transient warmup failure does not shrink capacity", async () => {
+    const tracker = createTracker();
+    let creations = 0;
+    const pool = await RuntimePool.create({
+      modelName: "fake-whisper-small",
+      capacity: 1,
+      decodeTimeoutMs: 20,
+      createHandle: () => {
+        creations += 1;
+        const handle = new FakeHandle(tracker);
+        if (creations === 2) {
+          handle.warmup = async () => {
+            tracker.warmups += 1;
+            throw new Error("warmup failed once");
+          };
+        }
+        return handle;
+      },
+    });
+    pools.push(pool);
+
+    const session = await pool.open(makeSessionRequest(["en-US"]));
+    tracker.handles[0]!.decodeImpl = () => new Promise(() => undefined);
+    await expect(session.decode("provisional", new Int16Array(320), "")).rejects.toThrow(/timeout/i);
+    await session.close();
+
+    // First replacement warmup fails, second succeeds — capacity restored.
+    expect(tracker.created).toBe(3);
+    const next = await pool.open(makeSessionRequest(["en-US"]));
+    await next.close();
+  });
 });
