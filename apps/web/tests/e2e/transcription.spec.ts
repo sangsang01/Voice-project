@@ -411,7 +411,7 @@ test("benchmark: reports synthetic transcription UI lifecycle timings", async ({
   await expect(page.getByText("synthetic provisional")).toBeVisible();
   const firstProvisionalUiMs = Math.round(performance.now() - startedAt);
   await page.getByRole("button", { name: "Stop" }).click();
-  await expect(page.getByText("synthetic final")).toBeVisible();
+  await expect(page.locator('.transcript [data-final="true"]', { hasText: "synthetic final" })).toBeVisible();
   const finalUiMs = Math.round(performance.now() - startedAt);
 
   const timings = {
