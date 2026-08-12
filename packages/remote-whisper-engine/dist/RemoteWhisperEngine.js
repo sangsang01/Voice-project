@@ -6,11 +6,14 @@ const SOCKET_OPEN = 1;
 const SOCKET_CLOSING = 2;
 const SOCKET_CLOSED = 3;
 const PROTOCOL = "voice-transcription.v1";
+const MAX_BUFFERED_BYTES = 1_048_576;
 class RemoteSession {
     request;
     sendControl;
     sendFrame;
     onTerminal;
+    maxUnacknowledgedFrames;
+    getBufferedAmount;
     listeners = new Set();
     pendingEvents = [];
     remoteEventSequence = -1;
@@ -20,11 +23,16 @@ class RemoteSession {
     stopping;
     resolveStop;
     subscribed = false;
-    constructor(request, sendControl, sendFrame, onTerminal) {
+    lowestUnackedSequence = 0;
+    highestSentSequence = -1;
+    outstandingSequences = new Set();
+    constructor(request, sendControl, sendFrame, onTerminal, maxUnacknowledgedFrames, getBufferedAmount) {
         this.request = request;
         this.sendControl = sendControl;
         this.sendFrame = sendFrame;
         this.onTerminal = onTerminal;
+        this.maxUnacknowledgedFrames = maxUnacknowledgedFrames;
+        this.getBufferedAmount = getBufferedAmount;
     }
     startListening() {
         this.emit({ type: "state", sessionId: this.request.sessionId, sequence: -1, state: "listening" });
@@ -33,8 +41,33 @@ class RemoteSession {
     push(frame) {
         if (this.terminal || this.closing)
             return { accepted: false, reason: "backpressure" };
+        if (this.outstandingSequences.size >= this.maxUnacknowledgedFrames)
+            return { accepted: false, reason: "backpressure" };
+        if (this.getBufferedAmount() > MAX_BUFFERED_BYTES)
+            return { accepted: false, reason: "backpressure" };
         const valid = validatePcmFrame(frame);
-        return this.sendFrame(valid) ? { accepted: true } : { accepted: false, reason: "backpressure" };
+        this.highestSentSequence = Math.max(this.highestSentSequence, valid.sequence);
+        this.outstandingSequences.add(valid.sequence);
+        if (!this.sendFrame(valid)) {
+            this.outstandingSequences.delete(valid.sequence);
+            return { accepted: false, reason: "backpressure" };
+        }
+        return { accepted: true };
+    }
+    receiveAck(throughSequence) {
+        if (this.terminal)
+            return;
+        if (throughSequence > this.highestSentSequence) {
+            this.fail("INTERNAL", "received acknowledgement beyond the highest sent sequence");
+            return;
+        }
+        if (throughSequence < this.lowestUnackedSequence)
+            return;
+        for (const sequence of this.outstandingSequences) {
+            if (sequence <= throughSequence)
+                this.outstandingSequences.delete(sequence);
+        }
+        this.lowestUnackedSequence = throughSequence + 1;
     }
     stop() {
         if (this.stopping)
@@ -193,7 +226,7 @@ export class RemoteWhisperEngine {
         const session = new RemoteSession(valid, (message) => this.sendControl(message), (frame) => this.sendFrame(frame), (terminalSession) => {
             if (this.activeSession === terminalSession)
                 this.activeSession = undefined;
-        });
+        }, this.options.maxUnacknowledgedFrames ?? Number.POSITIVE_INFINITY, () => this.socket?.bufferedAmount ?? 0);
         let pendingOpen;
         const opening = new Promise((resolve, reject) => {
             pendingOpen = { request: valid, session, resolve, reject };
@@ -323,6 +356,11 @@ export class RemoteWhisperEngine {
             }
             if (message.type === "engine.event") {
                 this.activeSession?.receive(message.event);
+                return;
+            }
+            if (message.type === "audio.ack") {
+                if (this.activeSession?.sessionId === message.sessionId)
+                    this.activeSession.receiveAck(message.throughSequence);
             }
         }
         catch (error) {

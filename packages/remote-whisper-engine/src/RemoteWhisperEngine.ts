@@ -23,6 +23,7 @@ const SOCKET_OPEN = 1;
 const SOCKET_CLOSING = 2;
 const SOCKET_CLOSED = 3;
 const PROTOCOL = "voice-transcription.v1";
+const MAX_BUFFERED_BYTES = 1_048_576;
 
 export interface RemoteWhisperEngineOptions {
   endpoint: string;
@@ -48,12 +49,17 @@ class RemoteSession implements TranscriptionSession {
   private stopping: Promise<void> | undefined;
   private resolveStop: (() => void) | undefined;
   private subscribed = false;
+  private lowestUnackedSequence = 0;
+  private highestSentSequence = -1;
+  private readonly outstandingSequences = new Set<number>();
 
   public constructor(
     private readonly request: SessionRequest,
     private readonly sendControl: (message: unknown) => void,
     private readonly sendFrame: (frame: PcmFrame) => boolean,
     private readonly onTerminal: (session: RemoteSession) => void,
+    private readonly maxUnacknowledgedFrames: number,
+    private readonly getBufferedAmount: () => number,
   ) {}
 
   public startListening(): void {
@@ -63,8 +69,29 @@ class RemoteSession implements TranscriptionSession {
 
   public push(frame: PcmFrame): PushResult {
     if (this.terminal || this.closing) return { accepted: false, reason: "backpressure" };
+    if (this.outstandingSequences.size >= this.maxUnacknowledgedFrames) return { accepted: false, reason: "backpressure" };
+    if (this.getBufferedAmount() > MAX_BUFFERED_BYTES) return { accepted: false, reason: "backpressure" };
     const valid = validatePcmFrame(frame);
-    return this.sendFrame(valid) ? { accepted: true } : { accepted: false, reason: "backpressure" };
+    this.highestSentSequence = Math.max(this.highestSentSequence, valid.sequence);
+    this.outstandingSequences.add(valid.sequence);
+    if (!this.sendFrame(valid)) {
+      this.outstandingSequences.delete(valid.sequence);
+      return { accepted: false, reason: "backpressure" };
+    }
+    return { accepted: true };
+  }
+
+  public receiveAck(throughSequence: number): void {
+    if (this.terminal) return;
+    if (throughSequence > this.highestSentSequence) {
+      this.fail("INTERNAL", "received acknowledgement beyond the highest sent sequence");
+      return;
+    }
+    if (throughSequence < this.lowestUnackedSequence) return;
+    for (const sequence of this.outstandingSequences) {
+      if (sequence <= throughSequence) this.outstandingSequences.delete(sequence);
+    }
+    this.lowestUnackedSequence = throughSequence + 1;
   }
 
   public stop(): Promise<void> {
@@ -223,6 +250,8 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
       (terminalSession) => {
         if (this.activeSession === terminalSession) this.activeSession = undefined;
       },
+      this.options.maxUnacknowledgedFrames ?? Number.POSITIVE_INFINITY,
+      () => this.socket?.bufferedAmount ?? 0,
     );
     let pendingOpen: PendingOpen;
     const opening = new Promise<TranscriptionSession>((resolve, reject) => {
@@ -348,6 +377,10 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
       }
       if (message.type === "engine.event") {
         this.activeSession?.receive(message.event);
+        return;
+      }
+      if (message.type === "audio.ack") {
+        if (this.activeSession?.sessionId === message.sessionId) this.activeSession.receiveAck(message.throughSequence);
       }
     } catch (error) {
       this.handleProtocolFailure(normalizeError(error, "invalid remote transcription message"));
