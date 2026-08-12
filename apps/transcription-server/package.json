@@ -13,9 +13,12 @@
   },
   "dependencies": {
     "@voice/streaming-protocol": "0.0.0",
-    "@voice/transcription-contracts": "0.0.0"
+    "@voice/transcription-contracts": "0.0.0",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/ws": "^8.18.1",
     "typescript": "6.0.3",
     "vitest": "4.1.10"
   }
