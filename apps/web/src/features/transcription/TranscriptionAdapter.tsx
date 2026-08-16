@@ -46,6 +46,7 @@ export function TranscriptionAdapter({ initialLanguages = [], engineFactory, mic
   // subscriptions or timers), so it's safe for React to invoke this
   // initializer more than once (e.g. Strict Mode) and keep only one result.
   // Disposal still needs an effect, since that's a side effect on unmount.
+  // eslint-disable-next-line react-hooks/refs -- factory is stored, not invoked; modeRef is read on Start
   const [controller] = useState<SessionController>(() => new SessionController({
     dispatch,
     engineFactory: engineFactory ?? ((options) => createEngine(modeRef.current, options?.onProgress ?? (() => undefined))),
