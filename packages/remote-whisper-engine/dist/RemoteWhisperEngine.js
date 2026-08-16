@@ -3,6 +3,7 @@ import { validatePcmFrame, validateSessionRequest } from "@voice/transcription-c
 import { browserSocketFactory } from "./socket.js";
 const SUBPROTOCOL = "voice-transcription.v1";
 const DEFAULT_MAX_UNACKNOWLEDGED_FRAMES = 250;
+const MAX_SOCKET_BUFFERED_AMOUNT = 1_048_576;
 const SOCKET_OPEN = 1;
 const SOCKET_CLOSED = 3;
 const terminalPush = { accepted: false, reason: "backpressure" };
@@ -15,6 +16,7 @@ function asError(error) {
 class RemoteSession {
     request;
     socket;
+    maxUnacknowledgedFrames;
     listeners = new Set();
     pendingEvents = [];
     subscribed = false;
@@ -24,9 +26,12 @@ class RemoteSession {
     stopping;
     resolveStop;
     lastSequence = -1;
-    constructor(request, socket) {
+    highestSentSequence = -1;
+    outstanding = new Set();
+    constructor(request, socket, maxUnacknowledgedFrames) {
         this.request = request;
         this.socket = socket;
+        this.maxUnacknowledgedFrames = maxUnacknowledgedFrames;
     }
     get sessionId() {
         return this.request.sessionId;
@@ -37,13 +42,32 @@ class RemoteSession {
     push(frame) {
         if (this.terminal || this.closing || this.socket.readyState !== SOCKET_OPEN)
             return terminalPush;
+        if (this.outstanding.size >= this.maxUnacknowledgedFrames)
+            return terminalPush;
+        if (this.socket.bufferedAmount > MAX_SOCKET_BUFFERED_AMOUNT)
+            return terminalPush;
         try {
-            this.socket.send(encodePcmMessage(validatePcmFrame(frame)));
+            const valid = validatePcmFrame(frame);
+            this.socket.send(encodePcmMessage(valid));
+            this.outstanding.add(valid.sequence);
+            if (valid.sequence > this.highestSentSequence)
+                this.highestSentSequence = valid.sequence;
         }
         catch {
             return terminalPush;
         }
         return { accepted: true };
+    }
+    applyAck(throughSequence) {
+        if (this.terminal)
+            return true;
+        if (throughSequence > this.highestSentSequence)
+            return false;
+        for (const sequence of [...this.outstanding]) {
+            if (sequence <= throughSequence)
+                this.outstanding.delete(sequence);
+        }
+        return true;
     }
     stop() {
         if (this.stopping)
@@ -305,7 +329,7 @@ export class RemoteWhisperEngine {
             const pending = this.pendingOpen;
             if (!pending || message.sessionId !== pending.request.sessionId || !this.socket)
                 return;
-            const session = new RemoteSession(pending.request, this.socket);
+            const session = new RemoteSession(pending.request, this.socket, this.maxUnacknowledgedFrames);
             this.activeSession = session;
             this.pendingOpen = undefined;
             for (const queued of this.preAcceptEvents.splice(0))
@@ -314,6 +338,11 @@ export class RemoteWhisperEngine {
             return;
         }
         if (message.type === "audio.ack") {
+            const session = this.activeSession;
+            if (!session || message.sessionId !== session.sessionId)
+                return;
+            if (!session.applyAck(message.throughSequence))
+                this.failProtocol();
             return;
         }
         if (message.type === "engine.event")

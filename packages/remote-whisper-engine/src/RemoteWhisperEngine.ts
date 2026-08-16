@@ -21,6 +21,7 @@ import { browserSocketFactory, type SocketFactory, type SocketLike } from "./soc
 
 const SUBPROTOCOL = "voice-transcription.v1";
 const DEFAULT_MAX_UNACKNOWLEDGED_FRAMES = 250;
+const MAX_SOCKET_BUFFERED_AMOUNT = 1_048_576;
 const SOCKET_OPEN = 1;
 const SOCKET_CLOSED = 3;
 
@@ -50,10 +51,13 @@ class RemoteSession implements TranscriptionSession {
   private stopping: Promise<void> | undefined;
   private resolveStop: (() => void) | undefined;
   private lastSequence = -1;
+  private highestSentSequence = -1;
+  private readonly outstanding = new Set<number>();
 
   public constructor(
     private readonly request: SessionRequest,
     private readonly socket: SocketLike,
+    private readonly maxUnacknowledgedFrames: number,
   ) {}
 
   public get sessionId(): string {
@@ -66,12 +70,26 @@ class RemoteSession implements TranscriptionSession {
 
   public push(frame: PcmFrame): PushResult {
     if (this.terminal || this.closing || this.socket.readyState !== SOCKET_OPEN) return terminalPush;
+    if (this.outstanding.size >= this.maxUnacknowledgedFrames) return terminalPush;
+    if (this.socket.bufferedAmount > MAX_SOCKET_BUFFERED_AMOUNT) return terminalPush;
     try {
-      this.socket.send(encodePcmMessage(validatePcmFrame(frame)));
+      const valid = validatePcmFrame(frame);
+      this.socket.send(encodePcmMessage(valid));
+      this.outstanding.add(valid.sequence);
+      if (valid.sequence > this.highestSentSequence) this.highestSentSequence = valid.sequence;
     } catch {
       return terminalPush;
     }
     return { accepted: true };
+  }
+
+  public applyAck(throughSequence: number): boolean {
+    if (this.terminal) return true;
+    if (throughSequence > this.highestSentSequence) return false;
+    for (const sequence of [...this.outstanding]) {
+      if (sequence <= throughSequence) this.outstanding.delete(sequence);
+    }
+    return true;
   }
 
   public stop(): Promise<void> {
@@ -339,7 +357,7 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
     if (message.type === "session.accepted") {
       const pending = this.pendingOpen;
       if (!pending || message.sessionId !== pending.request.sessionId || !this.socket) return;
-      const session = new RemoteSession(pending.request, this.socket);
+      const session = new RemoteSession(pending.request, this.socket, this.maxUnacknowledgedFrames);
       this.activeSession = session;
       this.pendingOpen = undefined;
       for (const queued of this.preAcceptEvents.splice(0)) session.receive(queued);
@@ -348,6 +366,9 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
     }
 
     if (message.type === "audio.ack") {
+      const session = this.activeSession;
+      if (!session || message.sessionId !== session.sessionId) return;
+      if (!session.applyAck(message.throughSequence)) this.failProtocol();
       return;
     }
 
