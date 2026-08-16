@@ -7,7 +7,7 @@ export function assertLoopbackWebSocketUrl(url) {
     catch {
         throw new TypeError("transcription endpoint must be a valid URL");
     }
-    if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+    if (parsed.protocol !== "ws:") {
         throw new TypeError("transcription endpoint must use the ws: protocol");
     }
     const host = parsed.hostname.replace(/^\[|\]$/g, "");
