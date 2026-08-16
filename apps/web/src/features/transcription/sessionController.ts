@@ -96,6 +96,11 @@ export class SessionController {
     await this.release(active, "stop");
   }
 
+  public async resetEngine(): Promise<void> {
+    await this.stop();
+    await this.dropEngine();
+  }
+
   public async clearAndRestart(candidateLanguages: readonly string[]): Promise<string> {
     return this.beginStart(candidateLanguages, crypto.randomUUID());
   }
@@ -427,7 +432,7 @@ export class SessionController {
       const result = active.session.push(active.queuedFrames[0]);
       if (result.accepted) { active.queuedFrames.shift(); continue; }
       active.queuedFrames.shift();
-      this.onBackpressureWarning("Audio is arriving faster than the local model can process it; the oldest queued frame was dropped.");
+      this.onBackpressureWarning("Audio is arriving faster than the transcription service can process it; the oldest queued frame was dropped.");
       break;
     }
   }

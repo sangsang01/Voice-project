@@ -386,7 +386,15 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
       return;
     }
 
-    if (event.sessionId === this.activeSession?.sessionId) this.activeSession.receive(event);
+    if (event.sessionId === this.activeSession?.sessionId) {
+      this.activeSession.receive(event);
+      if (this.activeSession.isTerminal) this.releasePreparedConnection();
+    }
+  }
+
+  private releasePreparedConnection(): void {
+    this.prepared = false;
+    this.closeSocketOnce();
   }
 
   private failProtocol(): void {

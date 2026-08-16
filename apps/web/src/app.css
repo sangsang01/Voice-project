@@ -108,6 +108,26 @@ button { font: inherit; }
   aspect-ratio: 1;
 }
 
+.transcript-segment--provisional span:first-child { opacity: .72; }
+.transcript-updating {
+  margin-left: 8px;
+  color: #9aa7c2;
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
 
 @media (prefers-reduced-motion: reduce) {

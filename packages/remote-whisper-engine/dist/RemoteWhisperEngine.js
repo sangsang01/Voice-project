@@ -358,8 +358,15 @@ export class RemoteWhisperEngine {
             this.preAcceptEvents.push(event);
             return;
         }
-        if (event.sessionId === this.activeSession?.sessionId)
+        if (event.sessionId === this.activeSession?.sessionId) {
             this.activeSession.receive(event);
+            if (this.activeSession.isTerminal)
+                this.releasePreparedConnection();
+        }
+    }
+    releasePreparedConnection() {
+        this.prepared = false;
+        this.closeSocketOnce();
     }
     failProtocol() {
         this.rejectOpen(new Error("UNSUPPORTED: invalid server message"));

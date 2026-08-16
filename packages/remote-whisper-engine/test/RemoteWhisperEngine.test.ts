@@ -245,6 +245,51 @@ describe("RemoteWhisperEngine lifecycle", () => {
     await engine.dispose();
   });
 
+  it("opens a new WebSocket on the next prepare after a session stops", async () => {
+    const sockets: FakeSocket[] = [];
+    const engine = new RemoteWhisperEngine({
+      endpoint: "ws://127.0.0.1:8787",
+      socketFactory: createOpeningFactory(sockets),
+    });
+    await engine.prepare(request);
+    const opening = engine.open(request);
+    sockets[0]!.emitJson({
+      type: "session.accepted",
+      sessionId: request.sessionId,
+      model: "small",
+      backend: "cpu",
+    });
+    const session = await opening;
+    const stopping = session.stop();
+    sockets[0]!.emitJson({
+      type: "engine.event",
+      event: {
+        type: "state",
+        sessionId: request.sessionId,
+        sequence: 0,
+        state: "stopped",
+      },
+    });
+    await stopping;
+
+    const nextRequest = { ...request, sessionId: "session-2" };
+    await engine.prepare(nextRequest);
+
+    expect(sockets).toHaveLength(2);
+    expect(sockets[0]!.readyState).toBe(3);
+    expect(sockets[1]!.readyState).toBe(1);
+
+    const reopening = engine.open(nextRequest);
+    sockets[1]!.emitJson({
+      type: "session.accepted",
+      sessionId: nextRequest.sessionId,
+      model: "small",
+      backend: "cpu",
+    });
+    await reopening;
+    await engine.dispose();
+  });
+
   it("rejects prepare when the socket closes before it opens", async () => {
     const engine = new RemoteWhisperEngine({
       endpoint: "ws://127.0.0.1:8787",

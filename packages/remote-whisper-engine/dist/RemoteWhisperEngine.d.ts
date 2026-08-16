@@ -26,6 +26,7 @@ export declare class RemoteWhisperEngine implements TranscriptionEngine {
     dispose(): Promise<void>;
     private handleMessage;
     private handleEngineEvent;
+    private releasePreparedConnection;
     private failProtocol;
     private rejectOpen;
     private handleSocketClose;
