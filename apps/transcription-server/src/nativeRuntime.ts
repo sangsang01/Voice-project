@@ -55,9 +55,21 @@ export function createNativeStreamingRuntime(options: NativeStreamingRuntimeOpti
   async function ensureHandle(): Promise<void> {
     if (closed) throw new Error("native runtime is closed");
     if (handle) return;
-    handle = makeHandle();
-    await handle.warmup();
-    loadCount += 1;
+    const next = makeHandle();
+    handle = next;
+    try {
+      await next.warmup();
+      if (closed) {
+        next.close();
+        handle = undefined;
+        throw new Error("native runtime is closed");
+      }
+      loadCount += 1;
+    } catch (error) {
+      next.close();
+      if (handle === next) handle = undefined;
+      throw error;
+    }
   }
 
   async function ready(): Promise<void> {
@@ -66,7 +78,6 @@ export function createNativeStreamingRuntime(options: NativeStreamingRuntimeOpti
       await readyPromise;
     } catch (error) {
       readyPromise = undefined;
-      handle = undefined;
       throw error;
     }
   }
@@ -74,8 +85,8 @@ export function createNativeStreamingRuntime(options: NativeStreamingRuntimeOpti
   async function recycle(): Promise<void> {
     handle?.close();
     handle = undefined;
-    readyPromise = ensureHandle();
-    await readyPromise;
+    readyPromise = undefined;
+    await ready();
   }
 
   async function open(_request: SessionRequest): Promise<StreamingRuntimeSession> {

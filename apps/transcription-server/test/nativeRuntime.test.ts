@@ -83,6 +83,68 @@ describe("createNativeStreamingRuntime", () => {
     expect(runtime.loadCount).toBe(1);
   });
 
+  it("closes the native handle when warmup fails and retries ready()", async () => {
+    const handles: NativeRuntimeHandle[] = [];
+    let failWarmup = true;
+    const createHandle = vi.fn(() => {
+      const handle = fakeHandle({
+        warmup: vi.fn(async () => {
+          if (failWarmup) throw new Error("warmup failed");
+        }),
+      });
+      handles.push(handle);
+      return handle;
+    });
+    const runtime = createRuntime(createHandle);
+
+    await expect(runtime.ready()).rejects.toThrow(/warmup failed/);
+    expect(createHandle).toHaveBeenCalledTimes(1);
+    expect(handles[0]!.close).toHaveBeenCalledTimes(1);
+    expect(runtime.loadCount).toBe(0);
+
+    failWarmup = false;
+    await runtime.ready();
+    expect(createHandle).toHaveBeenCalledTimes(2);
+    expect(handles[1]!.warmup).toHaveBeenCalledTimes(1);
+    expect(handles[1]!.close).not.toHaveBeenCalled();
+    expect(runtime.loadCount).toBe(1);
+  });
+
+  it("closes a recycled handle when post-timeout warmup fails", async () => {
+    vi.useFakeTimers();
+    const handles: NativeRuntimeHandle[] = [];
+    const createHandle = vi.fn(() => {
+      const handle = fakeHandle({
+        decode: vi.fn(() => new Promise<NativeDecodeResult>(() => undefined)),
+        warmup: vi.fn(async () => {
+          if (handles.length === 2) throw new Error("warmup failed");
+        }),
+      });
+      handles.push(handle);
+      return handle;
+    });
+    const runtime = createRuntime(createHandle);
+    await runtime.ready();
+    const session = await runtime.open(request);
+
+    const hanging = session.decode("final", new Int16Array([1]), "");
+    const failed = expect(hanging).rejects.toThrow(/warmup failed|TIMEOUT/i);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await failed;
+
+    expect(handles[0]!.close).toHaveBeenCalledTimes(1);
+    expect(handles[1]!.close).toHaveBeenCalledTimes(1);
+    expect(runtime.loadCount).toBe(1);
+
+    await session.close();
+    await runtime.ready();
+    expect(createHandle).toHaveBeenCalledTimes(3);
+    expect(handles[2]!.warmup).toHaveBeenCalledTimes(1);
+    expect(handles[2]!.close).not.toHaveBeenCalled();
+    expect(runtime.loadCount).toBe(2);
+  });
+
   it("reuses the warm handle across sequential opens and throws when busy", async () => {
     const handle = fakeHandle();
     const createHandle = vi.fn(() => handle);
