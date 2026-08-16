@@ -182,10 +182,10 @@ export async function runLocalBenchmark(options = {}) {
   const sessionId = options.sessionId ?? "benchmark-1";
 
   const url = `ws://127.0.0.1:${port}`;
-  const socket = createWebSocket(url, SUBPROTOCOL, { origin });
-  const receiver = attachReceiver(socket, now);
-
+  let socket;
   try {
+    socket = await createWebSocket(url, SUBPROTOCOL, { origin });
+    const receiver = attachReceiver(socket, now);
     await waitForOpen(socket);
     socket.send(
       JSON.stringify({
@@ -270,7 +270,7 @@ export async function runLocalBenchmark(options = {}) {
     log(line);
     return { ...metrics, passed };
   } finally {
-    socket.close?.();
+    socket?.close?.();
   }
 }
 

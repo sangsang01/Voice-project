@@ -269,4 +269,17 @@ describe("runLocalBenchmark", () => {
     expect(result.passed).toBe(false);
     expect(harness.logs.join("\n")).not.toContain(CAPTION);
   });
+
+  it("awaits an async websocket factory before attaching listeners", async () => {
+    const harness = createDeps({ firstPartialAtMs: 400, refreshAtMs: 900, finalAtMs: 1300 });
+    const createSocket = harness.deps.createWebSocket;
+    const result = await runLocalBenchmark({
+      ...harness.deps,
+      model: "small",
+      createWebSocket: async (url, protocols, options) => createSocket(url, protocols, options),
+    });
+    expect(result.passed).toBe(true);
+    expect(result.firstPartialP95Ms).toBe(400);
+    expect(harness.logs.join("\n")).not.toContain(CAPTION);
+  });
 });
