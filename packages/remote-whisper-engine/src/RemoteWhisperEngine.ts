@@ -8,6 +8,7 @@ import type {
   EngineEvent,
   EngineEventListener,
   EngineInspection,
+  ErrorCode,
   PcmFrame,
   PushResult,
   SessionRequest,
@@ -110,6 +111,19 @@ class RemoteSession implements TranscriptionSession {
   public receive(event: EngineEvent): void {
     if (this.terminal || event.sessionId !== this.request.sessionId || event.sequence <= this.lastSequence) return;
     this.lastSequence = event.sequence;
+    if (event.type === "error" && event.fatal) {
+      this.closing = true;
+      this.terminal = true;
+      this.emit(event);
+      this.emit({
+        type: "state",
+        sessionId: this.request.sessionId,
+        sequence: this.nextSequence(),
+        state: "stopped",
+      });
+      this.resolveStop?.();
+      return;
+    }
     if (event.type === "state" && event.state === "stopped") {
       this.terminal = true;
       this.emit(event);
@@ -117,6 +131,27 @@ class RemoteSession implements TranscriptionSession {
       return;
     }
     this.emit(event);
+  }
+
+  public fail(code: ErrorCode, message: string): void {
+    if (this.terminal) return;
+    this.closing = true;
+    this.terminal = true;
+    this.emit({
+      type: "error",
+      sessionId: this.request.sessionId,
+      sequence: this.nextSequence(),
+      code,
+      fatal: true,
+      message,
+    });
+    this.emit({
+      type: "state",
+      sessionId: this.request.sessionId,
+      sequence: this.nextSequence(),
+      state: "stopped",
+    });
+    this.resolveStop?.();
   }
 
   public handleDisconnect(): void {
@@ -193,6 +228,7 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
   private prepareResolve: (() => void) | undefined;
   private prepareReject: ((error: Error) => void) | undefined;
   private pendingOpen: PendingOpen | undefined;
+  private preAcceptEvents: EngineEvent[] = [];
   private activeSession: RemoteSession | undefined;
   private didCloseSocket = false;
 
@@ -213,10 +249,12 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
 
   public async prepare(request: SessionRequest): Promise<void> {
     this.assertNotDisposed();
+    assertLoopbackWebSocketUrl(this.endpoint);
     validateSessionRequest(request);
     if (this.prepared && this.socket) return;
     if (this.preparing) return this.preparing;
 
+    this.abandonSocket();
     this.didCloseSocket = false;
     const socket = this.socketFactory(this.endpoint, [SUBPROTOCOL]);
     socket.binaryType = "arraybuffer";
@@ -252,7 +290,7 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
     this.assertNotDisposed();
     const valid = validateSessionRequest(request);
     if (!this.prepared || !this.socket) throw new Error("engine must be prepared before opening a session");
-    if (this.activeSession && !this.activeSession.isTerminal) {
+    if (this.pendingOpen || (this.activeSession && !this.activeSession.isTerminal)) {
       throw new Error("an active remote Whisper session already exists");
     }
 
@@ -260,7 +298,11 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
     const accepted = new Promise<TranscriptionSession>((resolve, reject) => {
       this.pendingOpen = { request: valid, resolve, reject };
     });
-    socket.send(JSON.stringify({ type: "session.start", protocol: 1, request: valid }));
+    try {
+      socket.send(JSON.stringify({ type: "session.start", protocol: 1, request: valid }));
+    } catch (error) {
+      this.rejectOpen(asError(error));
+    }
     return accepted;
   }
 
@@ -277,8 +319,7 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
       // Socket close is authoritative even if cancel send failed.
     }
     this.activeSession = undefined;
-    this.pendingOpen?.reject(new Error("engine is disposed"));
-    this.pendingOpen = undefined;
+    this.rejectOpen(new Error("engine is disposed"));
     this.settlePrepare(new Error("engine is disposed"));
   }
 
@@ -291,9 +332,7 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
     try {
       message = validateServerMessage(parseJsonMessage(data));
     } catch {
-      this.pendingOpen?.reject(new Error("invalid server message"));
-      this.pendingOpen = undefined;
-      this.activeSession?.handleDisconnect();
+      this.failProtocol();
       return;
     }
 
@@ -303,6 +342,7 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
       const session = new RemoteSession(pending.request, this.socket);
       this.activeSession = session;
       this.pendingOpen = undefined;
+      for (const queued of this.preAcceptEvents.splice(0)) session.receive(queued);
       pending.resolve(session);
       return;
     }
@@ -311,21 +351,51 @@ export class RemoteWhisperEngine implements TranscriptionEngine {
       return;
     }
 
-    if (message.type === "engine.event" && message.event.sessionId === this.activeSession?.sessionId) {
-      this.activeSession.receive(message.event);
+    if (message.type === "engine.event") this.handleEngineEvent(message.event);
+  }
+
+  private handleEngineEvent(event: EngineEvent): void {
+    const pending = this.pendingOpen;
+    if (pending && event.sessionId === pending.request.sessionId) {
+      if (event.type === "error" && event.fatal) {
+        this.rejectOpen(new Error(`${event.code}: ${event.message}`));
+        return;
+      }
+      this.preAcceptEvents.push(event);
+      return;
     }
+
+    if (event.sessionId === this.activeSession?.sessionId) this.activeSession.receive(event);
+  }
+
+  private failProtocol(): void {
+    this.rejectOpen(new Error("UNSUPPORTED: invalid server message"));
+    this.activeSession?.fail("UNSUPPORTED", "invalid server message");
+    this.closeSocketOnce();
+  }
+
+  private rejectOpen(error: Error): void {
+    const pending = this.pendingOpen;
+    this.pendingOpen = undefined;
+    this.preAcceptEvents = [];
+    pending?.reject(error);
   }
 
   private handleSocketClose(socket: SocketLike): void {
-    if (this.socket !== socket && this.socket !== undefined) return;
+    if (this.socket !== socket) return;
     const wasPrepared = this.prepared;
     this.didCloseSocket = true;
     this.prepared = false;
-    if (this.socket === socket) this.socket = undefined;
+    this.socket = undefined;
     if (!wasPrepared) this.settlePrepare(unavailableError());
-    this.pendingOpen?.reject(unavailableError());
-    this.pendingOpen = undefined;
+    this.rejectOpen(unavailableError());
     this.activeSession?.handleDisconnect();
+  }
+
+  private abandonSocket(): void {
+    const socket = this.socket;
+    this.socket = undefined;
+    if (socket && socket.readyState !== SOCKET_CLOSED) socket.close();
   }
 
   private closeSocketOnce(): void {

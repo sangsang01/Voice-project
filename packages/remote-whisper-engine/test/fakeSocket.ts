@@ -54,6 +54,10 @@ export class FakeSocket implements SocketLike {
     this.emit("message", messageEvent(JSON.stringify(value)));
   }
 
+  public emitText(data: string): void {
+    this.emit("message", messageEvent(data));
+  }
+
   public sentJson(): unknown[] {
     return this.sent.filter((value): value is string => typeof value === "string").map((value) => JSON.parse(value));
   }

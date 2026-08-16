@@ -125,4 +125,135 @@ describe("RemoteWhisperEngine lifecycle", () => {
     });
     await expect(engine.open(request)).rejects.toThrow(/prepared/);
   });
+
+  it("rejects open on a fatal engine event before session.accepted", async () => {
+    const sockets: FakeSocket[] = [];
+    const engine = new RemoteWhisperEngine({
+      endpoint: "ws://127.0.0.1:8787",
+      socketFactory: createOpeningFactory(sockets),
+    });
+    await engine.prepare(request);
+    const opening = engine.open(request);
+    sockets[0]!.emitJson({
+      type: "engine.event",
+      event: {
+        type: "error",
+        sessionId: request.sessionId,
+        sequence: 0,
+        code: "RESOURCE_EXHAUSTED",
+        fatal: true,
+        message: "another listen is already active",
+      },
+    });
+    await expect(opening).rejects.toThrow(/RESOURCE_EXHAUSTED/);
+    await engine.dispose();
+  });
+
+  it("keeps a fatal TIMEOUT and does not overwrite it with UNAVAILABLE on close", async () => {
+    const sockets: FakeSocket[] = [];
+    const engine = new RemoteWhisperEngine({
+      endpoint: "ws://127.0.0.1:8787",
+      socketFactory: createOpeningFactory(sockets),
+    });
+    await engine.prepare(request);
+    const opening = engine.open(request);
+    sockets[0]!.emitJson({
+      type: "session.accepted",
+      sessionId: request.sessionId,
+      model: "small",
+      backend: "cpu",
+    });
+    const session = await opening;
+    const events: Array<{ type: string; code?: string; state?: string; fatal?: boolean }> = [];
+    session.subscribe((event) => events.push(event as { type: string; code?: string; state?: string; fatal?: boolean }));
+    sockets[0]!.emitJson({
+      type: "engine.event",
+      event: {
+        type: "error",
+        sessionId: request.sessionId,
+        sequence: 0,
+        code: "TIMEOUT",
+        fatal: true,
+        message: "decode timed out",
+      },
+    });
+    sockets[0]!.close(1006, "lost");
+    expect(events.some((event) => event.type === "error" && event.code === "TIMEOUT" && event.fatal === true)).toBe(true);
+    expect(events.some((event) => event.type === "error" && event.code === "UNAVAILABLE")).toBe(false);
+    expect(events.some((event) => event.type === "state" && event.state === "stopped")).toBe(true);
+    expect(session.push({ sequence: 0, startMs: 0, samples: new Int16Array(320) })).toEqual({
+      accepted: false,
+      reason: "backpressure",
+    });
+    await engine.dispose();
+  });
+
+  it("treats malformed inbound JSON as fatal UNSUPPORTED and closes the socket", async () => {
+    const sockets: FakeSocket[] = [];
+    const engine = new RemoteWhisperEngine({
+      endpoint: "ws://127.0.0.1:8787",
+      socketFactory: createOpeningFactory(sockets),
+    });
+    await engine.prepare(request);
+    const opening = engine.open(request);
+    sockets[0]!.emitJson({
+      type: "session.accepted",
+      sessionId: request.sessionId,
+      model: "small",
+      backend: "cpu",
+    });
+    const session = await opening;
+    const events: Array<{ type: string; code?: string; state?: string; fatal?: boolean }> = [];
+    session.subscribe((event) => events.push(event as { type: string; code?: string; state?: string; fatal?: boolean }));
+    sockets[0]!.emitText("{not-json");
+    expect(events.some((event) => event.type === "error" && event.code === "UNSUPPORTED" && event.fatal === true)).toBe(true);
+    expect(events.some((event) => event.type === "state" && event.state === "stopped")).toBe(true);
+    expect(sockets[0]!.readyState).toBe(3);
+    await engine.dispose();
+  });
+
+  it("rejects prepare for a non-loopback endpoint without opening a socket", async () => {
+    const sockets: FakeSocket[] = [];
+    const engine = new RemoteWhisperEngine({
+      endpoint: "ws://192.168.1.8:8787",
+      socketFactory: (url) => {
+        const socket = new FakeSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    await expect(engine.prepare(request)).rejects.toThrow(/loopback/);
+    expect(sockets).toHaveLength(0);
+  });
+
+  it("rejects a second concurrent open before session.accepted", async () => {
+    const sockets: FakeSocket[] = [];
+    const engine = new RemoteWhisperEngine({
+      endpoint: "ws://127.0.0.1:8787",
+      socketFactory: createOpeningFactory(sockets),
+    });
+    await engine.prepare(request);
+    const opening = engine.open(request);
+    await expect(engine.open(request)).rejects.toThrow(/active/);
+    sockets[0]!.emitJson({
+      type: "session.accepted",
+      sessionId: request.sessionId,
+      model: "small",
+      backend: "cpu",
+    });
+    await opening;
+    await engine.dispose();
+  });
+
+  it("rejects prepare when the socket closes before it opens", async () => {
+    const engine = new RemoteWhisperEngine({
+      endpoint: "ws://127.0.0.1:8787",
+      socketFactory: (url) => {
+        const socket = new FakeSocket(url);
+        queueMicrotask(() => socket.close(1006, "refused"));
+        return socket;
+      },
+    });
+    await expect(engine.prepare(request)).rejects.toThrow(/unavailable|Whisper server/i);
+  });
 });

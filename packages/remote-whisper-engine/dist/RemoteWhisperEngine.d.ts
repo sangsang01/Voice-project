@@ -16,6 +16,7 @@ export declare class RemoteWhisperEngine implements TranscriptionEngine {
     private prepareResolve;
     private prepareReject;
     private pendingOpen;
+    private preAcceptEvents;
     private activeSession;
     private didCloseSocket;
     constructor(options: RemoteWhisperEngineOptions);
@@ -24,7 +25,11 @@ export declare class RemoteWhisperEngine implements TranscriptionEngine {
     open(request: SessionRequest): Promise<TranscriptionSession>;
     dispose(): Promise<void>;
     private handleMessage;
+    private handleEngineEvent;
+    private failProtocol;
+    private rejectOpen;
     private handleSocketClose;
+    private abandonSocket;
     private closeSocketOnce;
     private settlePrepare;
     private assertNotDisposed;

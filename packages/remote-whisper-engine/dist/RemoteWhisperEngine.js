@@ -84,6 +84,19 @@ class RemoteSession {
         if (this.terminal || event.sessionId !== this.request.sessionId || event.sequence <= this.lastSequence)
             return;
         this.lastSequence = event.sequence;
+        if (event.type === "error" && event.fatal) {
+            this.closing = true;
+            this.terminal = true;
+            this.emit(event);
+            this.emit({
+                type: "state",
+                sessionId: this.request.sessionId,
+                sequence: this.nextSequence(),
+                state: "stopped",
+            });
+            this.resolveStop?.();
+            return;
+        }
         if (event.type === "state" && event.state === "stopped") {
             this.terminal = true;
             this.emit(event);
@@ -91,6 +104,27 @@ class RemoteSession {
             return;
         }
         this.emit(event);
+    }
+    fail(code, message) {
+        if (this.terminal)
+            return;
+        this.closing = true;
+        this.terminal = true;
+        this.emit({
+            type: "error",
+            sessionId: this.request.sessionId,
+            sequence: this.nextSequence(),
+            code,
+            fatal: true,
+            message,
+        });
+        this.emit({
+            type: "state",
+            sessionId: this.request.sessionId,
+            sequence: this.nextSequence(),
+            state: "stopped",
+        });
+        this.resolveStop?.();
     }
     handleDisconnect() {
         if (this.terminal) {
@@ -159,6 +193,7 @@ export class RemoteWhisperEngine {
     prepareResolve;
     prepareReject;
     pendingOpen;
+    preAcceptEvents = [];
     activeSession;
     didCloseSocket = false;
     constructor(options) {
@@ -177,11 +212,13 @@ export class RemoteWhisperEngine {
     }
     async prepare(request) {
         this.assertNotDisposed();
+        assertLoopbackWebSocketUrl(this.endpoint);
         validateSessionRequest(request);
         if (this.prepared && this.socket)
             return;
         if (this.preparing)
             return this.preparing;
+        this.abandonSocket();
         this.didCloseSocket = false;
         const socket = this.socketFactory(this.endpoint, [SUBPROTOCOL]);
         socket.binaryType = "arraybuffer";
@@ -217,14 +254,19 @@ export class RemoteWhisperEngine {
         const valid = validateSessionRequest(request);
         if (!this.prepared || !this.socket)
             throw new Error("engine must be prepared before opening a session");
-        if (this.activeSession && !this.activeSession.isTerminal) {
+        if (this.pendingOpen || (this.activeSession && !this.activeSession.isTerminal)) {
             throw new Error("an active remote Whisper session already exists");
         }
         const socket = this.socket;
         const accepted = new Promise((resolve, reject) => {
             this.pendingOpen = { request: valid, resolve, reject };
         });
-        socket.send(JSON.stringify({ type: "session.start", protocol: 1, request: valid }));
+        try {
+            socket.send(JSON.stringify({ type: "session.start", protocol: 1, request: valid }));
+        }
+        catch (error) {
+            this.rejectOpen(asError(error));
+        }
         return accepted;
     }
     async dispose() {
@@ -242,8 +284,7 @@ export class RemoteWhisperEngine {
             // Socket close is authoritative even if cancel send failed.
         }
         this.activeSession = undefined;
-        this.pendingOpen?.reject(new Error("engine is disposed"));
-        this.pendingOpen = undefined;
+        this.rejectOpen(new Error("engine is disposed"));
         this.settlePrepare(new Error("engine is disposed"));
     }
     handleMessage(socket, event) {
@@ -257,9 +298,7 @@ export class RemoteWhisperEngine {
             message = validateServerMessage(parseJsonMessage(data));
         }
         catch {
-            this.pendingOpen?.reject(new Error("invalid server message"));
-            this.pendingOpen = undefined;
-            this.activeSession?.handleDisconnect();
+            this.failProtocol();
             return;
         }
         if (message.type === "session.accepted") {
@@ -269,29 +308,58 @@ export class RemoteWhisperEngine {
             const session = new RemoteSession(pending.request, this.socket);
             this.activeSession = session;
             this.pendingOpen = undefined;
+            for (const queued of this.preAcceptEvents.splice(0))
+                session.receive(queued);
             pending.resolve(session);
             return;
         }
         if (message.type === "audio.ack") {
             return;
         }
-        if (message.type === "engine.event" && message.event.sessionId === this.activeSession?.sessionId) {
-            this.activeSession.receive(message.event);
+        if (message.type === "engine.event")
+            this.handleEngineEvent(message.event);
+    }
+    handleEngineEvent(event) {
+        const pending = this.pendingOpen;
+        if (pending && event.sessionId === pending.request.sessionId) {
+            if (event.type === "error" && event.fatal) {
+                this.rejectOpen(new Error(`${event.code}: ${event.message}`));
+                return;
+            }
+            this.preAcceptEvents.push(event);
+            return;
         }
+        if (event.sessionId === this.activeSession?.sessionId)
+            this.activeSession.receive(event);
+    }
+    failProtocol() {
+        this.rejectOpen(new Error("UNSUPPORTED: invalid server message"));
+        this.activeSession?.fail("UNSUPPORTED", "invalid server message");
+        this.closeSocketOnce();
+    }
+    rejectOpen(error) {
+        const pending = this.pendingOpen;
+        this.pendingOpen = undefined;
+        this.preAcceptEvents = [];
+        pending?.reject(error);
     }
     handleSocketClose(socket) {
-        if (this.socket !== socket && this.socket !== undefined)
+        if (this.socket !== socket)
             return;
         const wasPrepared = this.prepared;
         this.didCloseSocket = true;
         this.prepared = false;
-        if (this.socket === socket)
-            this.socket = undefined;
+        this.socket = undefined;
         if (!wasPrepared)
             this.settlePrepare(unavailableError());
-        this.pendingOpen?.reject(unavailableError());
-        this.pendingOpen = undefined;
+        this.rejectOpen(unavailableError());
         this.activeSession?.handleDisconnect();
+    }
+    abandonSocket() {
+        const socket = this.socket;
+        this.socket = undefined;
+        if (socket && socket.readyState !== SOCKET_CLOSED)
+            socket.close();
     }
     closeSocketOnce() {
         if (this.didCloseSocket)
