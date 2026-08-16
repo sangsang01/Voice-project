@@ -24,6 +24,7 @@ class MockSocket extends EventEmitter {
       firstPartialAtMs: number;
       refreshAtMs: number;
       finalAtMs: number;
+      emitSecondPartial?: boolean;
     },
   ) {
     super();
@@ -95,7 +96,7 @@ class MockSocket extends EventEmitter {
       });
     }
 
-    if (this.pcmCount === 2) {
+    if (this.pcmCount === 2 && this.script.emitSecondPartial !== false) {
       this.clock.t = this.script.refreshAtMs;
       this.emitJson({
         type: "engine.event",
@@ -141,7 +142,12 @@ class MockSocket extends EventEmitter {
   }
 }
 
-function createDeps(script: { firstPartialAtMs: number; refreshAtMs: number; finalAtMs: number }) {
+function createDeps(script: {
+  firstPartialAtMs: number;
+  refreshAtMs: number;
+  finalAtMs: number;
+  emitSecondPartial?: boolean;
+}) {
   const clock = { t: 0 };
   const logs: string[] = [];
   const files = new Map<string, string>();
@@ -245,5 +251,22 @@ describe("runLocalBenchmark", () => {
     });
     expect(result.passed).toBe(false);
     expect(result.firstPartialP95Ms).toBe(1800);
+  });
+
+  it("fails the refresh gate when a first partial never gets a second revision", async () => {
+    const harness = createDeps({
+      firstPartialAtMs: 400,
+      refreshAtMs: 900,
+      finalAtMs: 1300,
+      emitSecondPartial: false,
+    });
+    const result = await runLocalBenchmark({
+      ...harness.deps,
+      model: "small",
+    });
+    expect(result.firstPartialP95Ms).toBe(400);
+    expect(result.refreshP95Ms).toBe(Number.POSITIVE_INFINITY);
+    expect(result.passed).toBe(false);
+    expect(harness.logs.join("\n")).not.toContain(CAPTION);
   });
 });

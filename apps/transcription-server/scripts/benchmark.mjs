@@ -254,7 +254,7 @@ export async function runLocalBenchmark(options = {}) {
     const wallMs = Math.max(1, now() - wallStartedAt);
     const metrics = {
       firstPartialP95Ms: samples.firstPartials.length === 0 ? Number.POSITIVE_INFINITY : percentile(samples.firstPartials, 95),
-      refreshP95Ms: percentile(samples.refreshIntervals, 95),
+      refreshP95Ms: samples.refreshIntervals.length === 0 ? Number.POSITIVE_INFINITY : percentile(samples.refreshIntervals, 95),
       finalAfterSilenceP95Ms:
         samples.finalsAfterSilence.length === 0 ? Number.POSITIVE_INFINITY : percentile(samples.finalsAfterSilence, 95),
       realTimeFactor: wallMs / audioMs,
