@@ -6,7 +6,9 @@
 #include <whisper.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -25,6 +27,17 @@ bool ContainsEnglishOnlyMarker(const std::string & path) {
 void Int16ToFloat(const int16_t * input, size_t count, float * output) {
   for (size_t i = 0; i < count; ++i) {
     output[i] = static_cast<float>(input[i]) / kInt16Scale;
+  }
+}
+
+bool AbortIfRequested(void * userData) {
+  const auto * aborting = static_cast<const std::atomic<bool> *>(userData);
+  return aborting != nullptr && aborting->load(std::memory_order_acquire);
+}
+
+void WhisperLogFilter(enum ggml_log_level level, const char * text, void * /*userData*/) {
+  if (level >= GGML_LOG_LEVEL_ERROR && text != nullptr) {
+    fputs(text, stderr);
   }
 }
 
@@ -67,6 +80,7 @@ class WhisperRuntimeWrap : public Napi::ObjectWrap<WhisperRuntimeWrap> {
   std::vector<float> vadCarry_;
   int threads_ = 1;
   bool closed_ = false;
+  std::atomic<bool> abortRequested_{false};
 };
 
 Napi::FunctionReference WhisperRuntimeWrap::constructor;
@@ -198,6 +212,7 @@ WhisperRuntimeWrap::WhisperRuntimeWrap(const Napi::CallbackInfo & info)
 }
 
 WhisperRuntimeWrap::~WhisperRuntimeWrap() {
+  abortRequested_.store(true, std::memory_order_release);
   std::lock_guard<std::mutex> decodeLock(decodeMutex_);
   std::lock_guard<std::mutex> stateLock(stateMutex_);
   FreeResources();
@@ -301,6 +316,7 @@ Napi::Value WhisperRuntimeWrap::Reset(const Napi::CallbackInfo & info) {
 }
 
 Napi::Value WhisperRuntimeWrap::Close(const Napi::CallbackInfo & info) {
+  abortRequested_.store(true, std::memory_order_release);
   std::lock_guard<std::mutex> decodeLock(decodeMutex_);
   std::lock_guard<std::mutex> stateLock(stateMutex_);
   FreeResources();
@@ -337,6 +353,8 @@ DecodeResult WhisperRuntimeWrap::RunDecode(const std::vector<int16_t> & samples,
   params.single_segment = true;
   params.no_context = true;
   params.vad = false;
+  params.abort_callback = AbortIfRequested;
+  params.abort_callback_user_data = &abortRequested_;
 
   if (!prompt.empty()) {
     int nTokens = whisper_tokenize(ctx, prompt.c_str(), nullptr, 0);
@@ -354,6 +372,9 @@ DecodeResult WhisperRuntimeWrap::RunDecode(const std::vector<int16_t> & samples,
   }
 
   if (whisper_full(ctx, params, pcm.data(), static_cast<int>(pcm.size())) != 0) {
+    if (abortRequested_.load(std::memory_order_acquire)) {
+      throw std::runtime_error("decode aborted");
+    }
     throw std::runtime_error("whisper_full failed");
   }
 
@@ -388,6 +409,7 @@ DecodeResult WhisperRuntimeWrap::RunDecode(const std::vector<int16_t> & samples,
 }
 
 Napi::Object InitAddon(Napi::Env env, Napi::Object exports) {
+  whisper_log_set(WhisperLogFilter, nullptr);
   return WhisperRuntimeWrap::Init(env, exports);
 }
 
