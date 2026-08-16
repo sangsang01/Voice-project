@@ -328,6 +328,73 @@ describe("SessionScheduler", () => {
     expect(runtime.decodes.filter((decode) => decode.kind === "provisional")).toHaveLength(3);
   });
 
+  it("stop during an in-flight speech-end final does not emit a second ordinal", async () => {
+    const { runtime, events, scheduler } = createHarness();
+    let resolveDecode: ((result: DecodeResult) => void) | undefined;
+    runtime.decodeImpl = () =>
+      new Promise((resolve) => {
+        if (!resolveDecode) {
+          resolveDecode = resolve;
+          return;
+        }
+        resolve({
+          text: "second utterance",
+          language: "en",
+          languageProbability: 1,
+          startMs: 0,
+          endMs: 800,
+        });
+      });
+
+    scheduler.start();
+    let sequence = beginSpeech(runtime, scheduler, 0);
+    sequence = pushSpeaking(runtime, scheduler, sequence, 40);
+
+    runtime.nextVad = { speechStarted: false, speechEnded: true, maxDuration: false };
+    scheduler.push(frame(sequence));
+    await settle();
+    expect(runtime.decodes).toEqual([expect.objectContaining({ kind: "final" })]);
+
+    const stopping = scheduler.stop();
+    resolveDecode!({
+      text: "hello how are you",
+      language: "en",
+      languageProbability: 1,
+      startMs: 0,
+      endMs: 800,
+    });
+    await stopping;
+    await settle();
+
+    expect(runtime.decodes.filter((decode) => decode.kind === "final")).toHaveLength(1);
+    expect(upserts(events).filter((event) => event.segment.isFinal)).toEqual([
+      expect.objectContaining({
+        segment: expect.objectContaining({ id: "session-1:0", ordinal: 0, isFinal: true }),
+      }),
+    ]);
+    expect(events.at(-1)).toMatchObject({ type: "state", state: "stopped" });
+  });
+
+  it("stop after silence-only frames does not decode", async () => {
+    const { runtime, events, scheduler } = createHarness();
+    scheduler.start();
+    runtime.nextVad = { speechStarted: false, speechEnded: false, maxDuration: false };
+    for (let index = 0; index < 10; index += 1) {
+      scheduler.push(frame(index));
+    }
+
+    await scheduler.stop();
+    await settle();
+
+    expect(events.map((event) => (event.type === "state" ? event.state : event.type))).toEqual([
+      "listening",
+      "draining",
+      "stopped",
+    ]);
+    expect(runtime.decodes).toHaveLength(0);
+    expect(upserts(events)).toHaveLength(0);
+  });
+
   it("assigns a monotonic sequence on every engine event", async () => {
     const { runtime, events, scheduler } = createHarness();
     scheduler.start();

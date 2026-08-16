@@ -16,7 +16,9 @@ export class SessionScheduler {
     revision = 0;
     prompt = "";
     speaking = false;
+    speechSeen = false;
     currentFinalized = false;
+    finalOutstanding = false;
     terminal = false;
     cancelled = false;
     utteranceStartMs = 0;
@@ -55,11 +57,10 @@ export class SessionScheduler {
             return;
         this.emitState("draining");
         this.clearIntervalTimer();
-        if (this.speaking || this.hasUnfinalizedSpeech()) {
-            this.speaking = false;
+        this.speaking = false;
+        if (this.hasUnfinalizedSpeech())
             this.queueDecode("final");
-            await this.pump;
-        }
+        await this.pump;
         if (this.terminal)
             return;
         this.terminal = true;
@@ -77,7 +78,9 @@ export class SessionScheduler {
     }
     onSpeechStarted(startMs) {
         this.speaking = true;
+        this.speechSeen = true;
         this.currentFinalized = false;
+        this.finalOutstanding = false;
         this.revision = 0;
         this.utteranceStartMs = startMs;
         this.ensureTimer();
@@ -111,10 +114,15 @@ export class SessionScheduler {
     queueDecode(kind) {
         if (this.cancelled || this.terminal)
             return;
-        if (kind === "final")
+        if (kind === "final") {
+            if (this.finalOutstanding || this.currentFinalized)
+                return;
+            this.finalOutstanding = true;
             this.queued = "final";
-        else if (this.queued !== "final")
+        }
+        else if (this.queued !== "final") {
             this.queued = "provisional";
+        }
         this.pump = this.pump.then(() => this.drain());
     }
     async drain() {
@@ -125,7 +133,7 @@ export class SessionScheduler {
             while (this.queued && !this.cancelled && !this.terminal) {
                 const kind = this.queued;
                 this.queued = undefined;
-                if (kind === "provisional" && this.currentFinalized)
+                if (this.currentFinalized)
                     continue;
                 await this.runDecode(kind);
             }
@@ -209,7 +217,7 @@ export class SessionScheduler {
         return last ? last.startMs + FRAME_DURATION_MS : 0;
     }
     hasUnfinalizedSpeech() {
-        return !this.currentFinalized && this.frames.length > 0 && this.ordinal >= 0;
+        return this.speechSeen && !this.currentFinalized && !this.finalOutstanding;
     }
     emitState(state) {
         this.emitEnvelope({ type: "state", state });

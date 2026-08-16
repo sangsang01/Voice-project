@@ -26,7 +26,9 @@ export declare class SessionScheduler {
     private revision;
     private prompt;
     private speaking;
+    private speechSeen;
     private currentFinalized;
+    private finalOutstanding;
     private terminal;
     private cancelled;
     private utteranceStartMs;
