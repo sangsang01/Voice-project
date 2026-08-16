@@ -5,6 +5,7 @@ import WebSocket from "ws";
 
 import { FakeRuntime } from "../src/fakeRuntime.js";
 import { createTranscriptionGateway } from "../src/gateway.js";
+import type { DecodeResult, StreamingRuntimeSession, VadUpdate } from "../src/runtime.js";
 
 const SUBPROTOCOL = "voice-transcription.v1";
 const ALLOWED_ORIGIN = "http://localhost:5173";
@@ -120,6 +121,40 @@ async function startSession(port: number, sessionId = request.sessionId): Promis
     return typeof message === "object" && message !== null && (message as { type?: string }).type === "session.accepted";
   });
   return client;
+}
+
+async function expectUpgradeRejected(port: number, protocols?: string | string[]): Promise<void> {
+  const socket = track(
+    protocols === undefined
+      ? new WebSocket(`ws://127.0.0.1:${port}`, { origin: ALLOWED_ORIGIN })
+      : new WebSocket(`ws://127.0.0.1:${port}`, protocols, { origin: ALLOWED_ORIGIN }),
+  );
+  const outcome = await new Promise<"rejected" | "opened">((resolve) => {
+    socket.once("open", () => resolve("opened"));
+    socket.once("unexpected-response", () => resolve("rejected"));
+    socket.once("error", () => resolve("rejected"));
+  });
+  expect(outcome).toBe("rejected");
+}
+
+class RejectingDecodeRuntime extends FakeRuntime {
+  public override open(): Promise<StreamingRuntimeSession> {
+    this.openCount += 1;
+    let speechStarted = false;
+    return Promise.resolve({
+      push(): VadUpdate {
+        if (speechStarted) return { speechStarted: false, speechEnded: false, maxDuration: false };
+        speechStarted = true;
+        return { speechStarted: true, speechEnded: false, maxDuration: false };
+      },
+      decode(): Promise<DecodeResult> {
+        return Promise.reject(new Error("decode failed"));
+      },
+      close(): Promise<void> {
+        return Promise.resolve();
+      },
+    });
+  }
 }
 
 describe("transcription gateway", () => {
@@ -319,6 +354,83 @@ describe("transcription gateway", () => {
 
     releaseReady();
     await waitFor(client, (message) => (message as { type?: string }).type === "session.accepted");
+  });
+
+  it("releases admission if the client disconnects while ready() is pending", async () => {
+    const runtime = new FakeRuntime();
+    let readyCalls = 0;
+    let enteredFirstReady!: () => void;
+    const firstReadyEntered = new Promise<void>((resolve) => {
+      enteredFirstReady = resolve;
+    });
+    const readyImpl = runtime.ready.bind(runtime);
+    runtime.ready = async () => {
+      readyCalls += 1;
+      if (readyCalls === 1) {
+        enteredFirstReady();
+        await new Promise<void>(() => undefined);
+      }
+      return readyImpl();
+    };
+
+    const gateway = await listen(runtime);
+    const first = await connect(gateway.port);
+    first.socket.send(sessionStart("session-1"));
+    await firstReadyEntered;
+    first.socket.close();
+    await first.closeCode;
+
+    const second = await startSession(gateway.port, "session-2");
+    expect(second.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "session.accepted", sessionId: "session-2" }),
+      ]),
+    );
+  });
+
+  it("rejects a client that omits the subprotocol at upgrade", async () => {
+    const gateway = await listen();
+    await expectUpgradeRejected(gateway.port);
+  });
+
+  it("rejects a client that offers the wrong subprotocol at upgrade", async () => {
+    const gateway = await listen();
+    await expectUpgradeRejected(gateway.port, "not-voice-transcription");
+  });
+
+  it("PCM before session.start produces INVALID_AUDIO then close 4000", async () => {
+    const gateway = await listen();
+    const client = await connect(gateway.port);
+    client.socket.send(pcmFrame(0));
+
+    const error = await waitFor(client, (message) => {
+      return (message as { event?: { code?: string } }).event?.code === "INVALID_AUDIO";
+    });
+    expect(error).toMatchObject({
+      event: { type: "error", code: "INVALID_AUDIO", fatal: true },
+    });
+    await expect(client.closeCode).resolves.toBe(4000);
+  });
+
+  it("decode rejection emits a fatal event and closes the socket with 4000", async () => {
+    const gateway = await listen(new RejectingDecodeRuntime());
+    const client = await startSession(gateway.port);
+    client.socket.send(pcmFrame(0));
+
+    const error = await waitFor(
+      client,
+      (message) => {
+        return (
+          (message as { event?: { type?: string; fatal?: boolean } }).event?.type === "error" &&
+          (message as { event?: { fatal?: boolean } }).event?.fatal === true
+        );
+      },
+      2500,
+    );
+    expect(error).toMatchObject({
+      event: { type: "error", fatal: true, code: "INTERNAL" },
+    });
+    await expect(client.closeCode).resolves.toBe(4000);
   });
 
   it("reopens after close without reloading weights", async () => {

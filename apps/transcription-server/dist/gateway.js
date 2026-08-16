@@ -4,6 +4,16 @@ import { AdmissionPool } from "./admission.js";
 import { SessionScheduler } from "./sessionScheduler.js";
 const SUBPROTOCOL = "voice-transcription.v1";
 const CLOSE_PROTOCOL = 4000;
+function hasRequiredSubprotocol(req) {
+    const header = req.headers["sec-websocket-protocol"];
+    if (header === undefined)
+        return false;
+    const raw = Array.isArray(header) ? header.join(",") : header;
+    return raw
+        .split(",")
+        .map((item) => item.trim())
+        .includes(SUBPROTOCOL);
+}
 export function createTranscriptionGateway(options) {
     assertLoopbackBindHost(options.host);
     const capacity = options.capacity ?? 1;
@@ -16,13 +26,14 @@ export function createTranscriptionGateway(options) {
                 return protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false;
             },
             verifyClient(info) {
-                return options.allowedOrigins.includes(info.origin);
+                return options.allowedOrigins.includes(info.origin) && hasRequiredSubprotocol(info.req);
             },
         });
         const onListenError = (error) => reject(error);
         wss.once("error", onListenError);
         wss.once("listening", () => {
             wss.off("error", onListenError);
+            wss.on("error", () => undefined);
             const address = wss.address();
             if (!address || typeof address === "string") {
                 wss.close();
@@ -71,7 +82,10 @@ function bindConnection(socket, options, pool, capacity) {
         });
     });
     socket.on("close", () => {
-        chain = chain.then(() => finish(state, true)).catch(() => undefined);
+        finishDetached(state, true);
+    });
+    socket.on("error", () => {
+        finishDetached(state, true);
     });
     async function handleMessage(data, isBinary) {
         if (state.cleaned || socket.readyState !== WebSocket.OPEN)
@@ -123,10 +137,13 @@ async function acceptSession(socket, state, options, pool, capacity, request) {
     try {
         await options.runtime.ready();
         if (state.cleaned || socket.readyState !== WebSocket.OPEN) {
-            await finish(state, true);
             return;
         }
         const runtimeSession = await options.runtime.open(request);
+        if (state.cleaned || socket.readyState !== WebSocket.OPEN) {
+            await runtimeSession.close().catch(() => undefined);
+            return;
+        }
         state.runtimeSession = runtimeSession;
         const scheduler = new SessionScheduler({
             request,
@@ -136,7 +153,7 @@ async function acceptSession(socket, state, options, pool, capacity, request) {
                 sendJson(socket, { type: "engine.event", event });
                 if (event.type === "error" && event.fatal) {
                     socket.close(CLOSE_PROTOCOL, event.code);
-                    void finish(state, true);
+                    finishDetached(state, true);
                 }
             },
         });
@@ -170,7 +187,7 @@ async function handleBinary(socket, state, data) {
     if (state.lastPcmSequence !== undefined && frame.sequence !== state.lastPcmSequence + 1) {
         warn(socket, state, "AUDIO_GAP", `audio sequence jumped from ${state.lastPcmSequence} to ${frame.sequence}`);
         socket.close(CLOSE_PROTOCOL, "AUDIO_GAP");
-        await finish(state, true);
+        await finish(state, true).catch(() => undefined);
         return;
     }
     state.lastPcmSequence = frame.sequence;
@@ -194,12 +211,11 @@ async function finish(state, cancelIfActive) {
     finally {
         state.release?.();
         state.release = undefined;
-        try {
-            await state.runtimeSession?.close();
-        }
-        finally {
-            state.runtimeSession = undefined;
-            state.scheduler = undefined;
+        const runtimeSession = state.runtimeSession;
+        state.runtimeSession = undefined;
+        state.scheduler = undefined;
+        if (runtimeSession) {
+            await runtimeSession.close().catch(() => undefined);
         }
     }
 }
@@ -215,7 +231,10 @@ function fail(socket, state, code, message) {
     sendJson(socket, { type: "engine.event", event });
     if (socket.readyState === WebSocket.OPEN)
         socket.close(CLOSE_PROTOCOL, code);
-    void finish(state, true);
+    finishDetached(state, true);
+}
+function finishDetached(state, cancelIfActive) {
+    void finish(state, cancelIfActive).catch(() => undefined);
 }
 function warn(socket, state, code, message) {
     const event = {

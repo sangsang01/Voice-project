@@ -15,6 +15,16 @@ import { SessionScheduler } from "./sessionScheduler.js";
 const SUBPROTOCOL = "voice-transcription.v1";
 const CLOSE_PROTOCOL = 4000;
 
+function hasRequiredSubprotocol(req: IncomingMessage): boolean {
+  const header = req.headers["sec-websocket-protocol"];
+  if (header === undefined) return false;
+  const raw = Array.isArray(header) ? header.join(",") : header;
+  return raw
+    .split(",")
+    .map((item) => item.trim())
+    .includes(SUBPROTOCOL);
+}
+
 export interface GatewayOptions {
   host: string;
   port: number;
@@ -53,7 +63,7 @@ export function createTranscriptionGateway(options: GatewayOptions): Promise<Tra
         return protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false;
       },
       verifyClient(info: { origin: string; secure: boolean; req: IncomingMessage }) {
-        return options.allowedOrigins.includes(info.origin);
+        return options.allowedOrigins.includes(info.origin) && hasRequiredSubprotocol(info.req);
       },
     });
 
@@ -61,6 +71,7 @@ export function createTranscriptionGateway(options: GatewayOptions): Promise<Tra
     wss.once("error", onListenError);
     wss.once("listening", () => {
       wss.off("error", onListenError);
+      wss.on("error", () => undefined);
       const address = wss.address();
       if (!address || typeof address === "string") {
         wss.close();
@@ -119,7 +130,10 @@ function bindConnection(
   });
 
   socket.on("close", () => {
-    chain = chain.then(() => finish(state, true)).catch(() => undefined);
+    finishDetached(state, true);
+  });
+  socket.on("error", () => {
+    finishDetached(state, true);
   });
 
   async function handleMessage(data: RawData, isBinary: boolean): Promise<void> {
@@ -195,11 +209,14 @@ async function acceptSession(
   try {
     await options.runtime.ready();
     if (state.cleaned || socket.readyState !== WebSocket.OPEN) {
-      await finish(state, true);
       return;
     }
 
     const runtimeSession = await options.runtime.open(request);
+    if (state.cleaned || socket.readyState !== WebSocket.OPEN) {
+      await runtimeSession.close().catch(() => undefined);
+      return;
+    }
     state.runtimeSession = runtimeSession;
     const scheduler = new SessionScheduler({
       request,
@@ -209,7 +226,7 @@ async function acceptSession(
         sendJson(socket, { type: "engine.event", event });
         if (event.type === "error" && event.fatal) {
           socket.close(CLOSE_PROTOCOL, event.code);
-          void finish(state, true);
+          finishDetached(state, true);
         }
       },
     });
@@ -244,7 +261,7 @@ async function handleBinary(socket: WebSocket, state: ConnectionState, data: Raw
   if (state.lastPcmSequence !== undefined && frame.sequence !== state.lastPcmSequence + 1) {
     warn(socket, state, "AUDIO_GAP", `audio sequence jumped from ${state.lastPcmSequence} to ${frame.sequence}`);
     socket.close(CLOSE_PROTOCOL, "AUDIO_GAP");
-    await finish(state, true);
+    await finish(state, true).catch(() => undefined);
     return;
   }
 
@@ -267,11 +284,11 @@ async function finish(state: ConnectionState, cancelIfActive: boolean): Promise<
   } finally {
     state.release?.();
     state.release = undefined;
-    try {
-      await state.runtimeSession?.close();
-    } finally {
-      state.runtimeSession = undefined;
-      state.scheduler = undefined;
+    const runtimeSession = state.runtimeSession;
+    state.runtimeSession = undefined;
+    state.scheduler = undefined;
+    if (runtimeSession) {
+      await runtimeSession.close().catch(() => undefined);
     }
   }
 }
@@ -287,7 +304,11 @@ function fail(socket: WebSocket, state: ConnectionState, code: ErrorCode, messag
   };
   sendJson(socket, { type: "engine.event", event });
   if (socket.readyState === WebSocket.OPEN) socket.close(CLOSE_PROTOCOL, code);
-  void finish(state, true);
+  finishDetached(state, true);
+}
+
+function finishDetached(state: ConnectionState, cancelIfActive: boolean): void {
+  void finish(state, cancelIfActive).catch(() => undefined);
 }
 
 function warn(socket: WebSocket, state: ConnectionState, code: WarningCode, message: string): void {

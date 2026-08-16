@@ -6,6 +6,9 @@ export interface DecodeMetrics {
   audioMs: number;
   realtimeFactor: number;
   model: string;
+  text?: never;
+  samples?: never;
+  pcm?: never;
 }
 
 export interface MetricsSink {
