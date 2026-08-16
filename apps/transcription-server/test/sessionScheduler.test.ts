@@ -76,9 +76,9 @@ function upserts(events: EngineEvent[]) {
 }
 
 async function settle(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let index = 0; index < 8; index += 1) {
+    await Promise.resolve();
+  }
 }
 
 describe("SessionScheduler", () => {
@@ -393,6 +393,157 @@ describe("SessionScheduler", () => {
     ]);
     expect(runtime.decodes).toHaveLength(0);
     expect(upserts(events)).toHaveLength(0);
+  });
+
+  it("keeps a pending speech-end final while the next utterance emits provisionals", async () => {
+    const { runtime, events, scheduler } = createHarness();
+    let resolveFirst: ((result: DecodeResult) => void) | undefined;
+    runtime.decodeImpl = () =>
+      new Promise((resolve) => {
+        if (!resolveFirst) {
+          resolveFirst = resolve;
+          return;
+        }
+        resolve({
+          text: "next",
+          language: "en",
+          languageProbability: 1,
+          startMs: 0,
+          endMs: 800,
+        });
+      });
+
+    scheduler.start();
+    let sequence = beginSpeech(runtime, scheduler, 0);
+    sequence = pushSpeaking(runtime, scheduler, sequence, 40);
+    runtime.nextVad = { speechStarted: false, speechEnded: true, maxDuration: false };
+    scheduler.push(frame(sequence));
+    sequence += 1;
+    sequence = beginSpeech(runtime, scheduler, sequence);
+    pushSpeaking(runtime, scheduler, sequence, 40);
+
+    await settle();
+    expect(runtime.decodes).toEqual([expect.objectContaining({ kind: "final" })]);
+
+    await vi.advanceTimersByTimeAsync(750);
+    await settle();
+    expect(runtime.decodes).toHaveLength(1);
+
+    resolveFirst!({
+      text: "hello how are you",
+      language: "en",
+      languageProbability: 1,
+      startMs: 0,
+      endMs: 800,
+    });
+    await settle();
+    await settle();
+
+    const segments = upserts(events);
+    expect(segments.filter((event) => event.segment.isFinal)).toEqual([
+      expect.objectContaining({
+        segment: expect.objectContaining({ id: "session-1:0", ordinal: 0, isFinal: true }),
+      }),
+    ]);
+    expect(segments.some((event) => event.segment.id === "session-1:1" && event.segment.ordinal === 1 && !event.segment.isFinal)).toBe(true);
+    expect(runtime.decodes.some((decode) => decode.kind === "provisional")).toBe(true);
+  });
+
+  it("keeps a pending maxDuration final while the next utterance emits provisionals", async () => {
+    const { runtime, events, scheduler } = createHarness();
+    let resolveFirst: ((result: DecodeResult) => void) | undefined;
+    runtime.decodeImpl = () =>
+      new Promise((resolve) => {
+        if (!resolveFirst) {
+          resolveFirst = resolve;
+          return;
+        }
+        resolve({
+          text: "next",
+          language: "en",
+          languageProbability: 1,
+          startMs: 0,
+          endMs: 800,
+        });
+      });
+
+    scheduler.start();
+    let sequence = beginSpeech(runtime, scheduler, 0);
+    sequence = pushSpeaking(runtime, scheduler, sequence, 40);
+    runtime.nextVad = { speechStarted: false, speechEnded: false, maxDuration: true };
+    scheduler.push(frame(sequence));
+    sequence += 1;
+    sequence = beginSpeech(runtime, scheduler, sequence);
+    pushSpeaking(runtime, scheduler, sequence, 40);
+
+    await settle();
+    expect(runtime.decodes).toEqual([expect.objectContaining({ kind: "final" })]);
+
+    await vi.advanceTimersByTimeAsync(750);
+    await settle();
+    expect(runtime.decodes).toHaveLength(1);
+
+    resolveFirst!({
+      text: "hello how are you",
+      language: "en",
+      languageProbability: 1,
+      startMs: 0,
+      endMs: 800,
+    });
+    await settle();
+
+    const segments = upserts(events);
+    expect(segments.filter((event) => event.segment.isFinal)).toEqual([
+      expect.objectContaining({
+        segment: expect.objectContaining({ id: "session-1:0", ordinal: 0, isFinal: true }),
+      }),
+    ]);
+    expect(segments.some((event) => event.segment.id === "session-1:1" && !event.segment.isFinal)).toBe(true);
+  });
+
+  it("decode rejection emits a fatal error and does not stall stop", async () => {
+    const { runtime, events, scheduler } = createHarness();
+    let attempts = 0;
+    runtime.decodeImpl = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("boom");
+      return {
+        text: "hello how are you",
+        language: "en",
+        languageProbability: 1,
+        startMs: 0,
+        endMs: 800,
+      };
+    };
+
+    scheduler.start();
+    const next = beginSpeech(runtime, scheduler, 0);
+    pushSpeaking(runtime, scheduler, next, 40);
+    await vi.advanceTimersByTimeAsync(750);
+    await settle();
+
+    expect(events.some((event) => event.type === "error" && event.code === "INTERNAL" && event.fatal)).toBe(true);
+
+    await scheduler.stop();
+    await settle();
+
+    expect(attempts).toBeGreaterThan(1);
+    expect(events.at(-1)).toMatchObject({ type: "state", state: "stopped" });
+  });
+
+  it("final decode uses the full utterance rather than the 8s provisional cap", async () => {
+    const { runtime, scheduler } = createHarness();
+    scheduler.start();
+    let sequence = beginSpeech(runtime, scheduler, 0);
+    sequence = pushSpeaking(runtime, scheduler, sequence, 999);
+    runtime.nextVad = { speechStarted: false, speechEnded: true, maxDuration: false };
+    scheduler.push(frame(sequence));
+    await settle();
+
+    const finals = runtime.decodes.filter((decode) => decode.kind === "final");
+    expect(finals).toHaveLength(1);
+    expect(finals[0]!.samples).toBeGreaterThan(8_000 * 16);
+    expect(finals[0]!.samples).toBeGreaterThanOrEqual(20_000 * 16);
   });
 
   it("assigns a monotonic sequence on every engine event", async () => {

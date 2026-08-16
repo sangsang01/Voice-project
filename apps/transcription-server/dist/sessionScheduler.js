@@ -12,20 +12,17 @@ export class SessionScheduler {
     maxWindowMs;
     overlapMs;
     sequence = 0;
-    ordinal = 0;
-    revision = 0;
+    nextOrdinal = 0;
     prompt = "";
     speaking = false;
-    speechSeen = false;
-    currentFinalized = false;
-    finalOutstanding = false;
     terminal = false;
     cancelled = false;
-    utteranceStartMs = 0;
+    live;
+    pendingFinals = [];
+    pendingProvisional = false;
     frames = [];
     timer;
     busy = false;
-    queued;
     pump = Promise.resolve();
     consecutiveSlowProvisionals = 0;
     constructor(options) {
@@ -47,10 +44,11 @@ export class SessionScheduler {
             return;
         this.frames.push({ startMs: frame.startMs, samples: frame.samples });
         const vad = this.runtime.push(frame);
-        if (vad.speechStarted)
-            this.onSpeechStarted(frame.startMs);
         if (vad.speechEnded || vad.maxDuration)
             this.onSpeechEnded();
+        if (vad.speechStarted)
+            this.onSpeechStarted(frame.startMs);
+        this.trimBuffer();
     }
     async stop() {
         if (this.terminal)
@@ -58,8 +56,7 @@ export class SessionScheduler {
         this.emitState("draining");
         this.clearIntervalTimer();
         this.speaking = false;
-        if (this.hasUnfinalizedSpeech())
-            this.queueDecode("final");
+        this.queueFrozenFinal();
         await this.pump;
         if (this.terminal)
             return;
@@ -70,7 +67,9 @@ export class SessionScheduler {
         if (this.terminal)
             return;
         this.cancelled = true;
-        this.queued = undefined;
+        this.pendingFinals = [];
+        this.pendingProvisional = false;
+        this.live = undefined;
         this.frames = [];
         this.clearIntervalTimer();
         this.terminal = true;
@@ -78,17 +77,53 @@ export class SessionScheduler {
     }
     onSpeechStarted(startMs) {
         this.speaking = true;
-        this.speechSeen = true;
-        this.currentFinalized = false;
-        this.finalOutstanding = false;
-        this.revision = 0;
-        this.utteranceStartMs = startMs;
+        this.live = {
+            startMs,
+            ordinal: this.nextOrdinal,
+            revision: 0,
+            finalQueued: false,
+        };
         this.ensureTimer();
     }
     onSpeechEnded() {
         this.speaking = false;
         this.clearIntervalTimer();
-        this.queueDecode("final");
+        this.queueFrozenFinal();
+    }
+    hasUnfinalizedSpeech() {
+        return this.live !== undefined && !this.live.finalQueued;
+    }
+    queueFrozenFinal() {
+        if (this.cancelled || this.terminal)
+            return;
+        if (!this.hasUnfinalizedSpeech() || !this.live)
+            return;
+        const snapshot = this.snapshotLiveFinal();
+        this.live.finalQueued = true;
+        this.nextOrdinal = this.live.ordinal + 1;
+        this.pendingProvisional = false;
+        this.pendingFinals.push(snapshot);
+        this.live = undefined;
+        this.kickPump();
+    }
+    queueProvisional() {
+        if (this.cancelled || this.terminal || !this.live || this.live.finalQueued)
+            return;
+        this.pendingProvisional = true;
+        this.kickPump();
+    }
+    snapshotLiveFinal() {
+        const live = this.live;
+        const endMs = this.utteranceEndMs();
+        const overlapStartMs = Math.max(0, live.startMs - this.overlapMs);
+        return {
+            samples: this.collectSamples(overlapStartMs, endMs),
+            startMs: live.startMs,
+            endMs,
+            ordinal: live.ordinal,
+            id: `${this.request.sessionId}:${live.ordinal}`,
+            revision: live.revision,
+        };
     }
     ensureTimer() {
         if (this.timer !== undefined || this.terminal)
@@ -98,9 +133,9 @@ export class SessionScheduler {
     scheduleTick() {
         this.timer = this.setTimer(() => {
             this.timer = undefined;
-            if (this.terminal || !this.speaking || this.currentFinalized)
+            if (this.terminal || !this.speaking || !this.live || this.live.finalQueued)
                 return;
-            this.queueDecode("provisional");
+            this.queueProvisional();
             if (this.speaking && !this.terminal)
                 this.scheduleTick();
         }, this.decodeIntervalMs);
@@ -111,72 +146,97 @@ export class SessionScheduler {
         this.clearTimer(this.timer);
         this.timer = undefined;
     }
-    queueDecode(kind) {
-        if (this.cancelled || this.terminal)
-            return;
-        if (kind === "final") {
-            if (this.finalOutstanding || this.currentFinalized)
-                return;
-            this.finalOutstanding = true;
-            this.queued = "final";
-        }
-        else if (this.queued !== "final") {
-            this.queued = "provisional";
-        }
-        this.pump = this.pump.then(() => this.drain());
+    kickPump() {
+        this.pump = this.pump.then(() => this.drain(), () => this.drain());
     }
     async drain() {
         if (this.busy)
             return;
         this.busy = true;
         try {
-            while (this.queued && !this.cancelled && !this.terminal) {
-                const kind = this.queued;
-                this.queued = undefined;
-                if (this.currentFinalized)
+            while (!this.cancelled && !this.terminal) {
+                const frozen = this.pendingFinals.shift();
+                if (frozen) {
+                    await this.runFrozenFinal(frozen);
                     continue;
-                await this.runDecode(kind);
+                }
+                if (this.pendingProvisional) {
+                    this.pendingProvisional = false;
+                    await this.runProvisional();
+                    continue;
+                }
+                break;
             }
         }
         finally {
             this.busy = false;
         }
     }
-    async runDecode(kind) {
-        const audio = this.buildWindow();
+    async runFrozenFinal(snapshot) {
+        if (snapshot.samples.length === 0)
+            return;
+        try {
+            const result = await this.runtime.decode("final", snapshot.samples, this.prompt);
+            if (this.cancelled || this.terminal)
+                return;
+            this.emitSegment({
+                id: snapshot.id,
+                ordinal: snapshot.ordinal,
+                revision: snapshot.revision,
+                startMs: result.startMs,
+                endMs: result.endMs,
+                text: result.text,
+                language: mapDetectedLanguage(result.language, result.languageProbability, this.request.candidateLanguages),
+                isFinal: true,
+            });
+            this.prompt = result.text.trim();
+        }
+        catch (error) {
+            this.emitDecodeError(error);
+        }
+    }
+    async runProvisional() {
+        const live = this.live;
+        if (!live || live.finalQueued)
+            return;
+        const audio = this.buildProvisionalWindow();
         if (audio.length === 0)
             return;
+        const ordinal = live.ordinal;
         const startedAt = this.now();
-        const result = await this.runtime.decode(kind, audio, this.prompt);
-        if (this.cancelled || this.terminal)
-            return;
-        if (kind === "provisional" && (this.queued === "final" || this.currentFinalized))
-            return;
-        const elapsedMs = this.now() - startedAt;
-        const audioDurationMs = (audio.length * 1000) / SAMPLE_RATE_HZ;
-        if (kind === "provisional")
+        try {
+            const result = await this.runtime.decode("provisional", audio, this.prompt);
+            if (this.cancelled || this.terminal)
+                return;
+            if (!this.live || this.live.ordinal !== ordinal || this.live.finalQueued)
+                return;
+            const elapsedMs = this.now() - startedAt;
+            const audioDurationMs = (audio.length * 1000) / SAMPLE_RATE_HZ;
             this.noteProvisionalTiming(elapsedMs, audioDurationMs);
-        const isFinal = kind === "final";
-        const segment = {
-            id: `${this.request.sessionId}:${this.ordinal}`,
-            ordinal: this.ordinal,
-            revision: this.revision++,
-            startMs: result.startMs,
-            endMs: result.endMs,
-            text: result.text,
-            language: isFinal
-                ? mapDetectedLanguage(result.language, result.languageProbability, this.request.candidateLanguages)
-                : { tag: "und" },
-            isFinal,
-        };
-        this.emitEnvelope({ type: "segment.upsert", segment });
-        if (isFinal) {
-            this.currentFinalized = true;
-            this.prompt = result.text.trim();
-            this.ordinal += 1;
-            this.revision = 0;
-            this.trimRetainedAudio();
+            this.emitSegment({
+                id: `${this.request.sessionId}:${ordinal}`,
+                ordinal,
+                revision: this.live.revision++,
+                startMs: result.startMs,
+                endMs: result.endMs,
+                text: result.text,
+                language: { tag: "und" },
+                isFinal: false,
+            });
         }
+        catch (error) {
+            this.emitDecodeError(error);
+        }
+    }
+    emitDecodeError(error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const code = /timeout/i.test(message) ? "TIMEOUT" : "INTERNAL";
+        this.emitEnvelope({
+            type: "error",
+            code,
+            fatal: true,
+            message,
+        });
     }
     noteProvisionalTiming(elapsedMs, audioDurationMs) {
         if (elapsedMs > audioDurationMs)
@@ -191,14 +251,16 @@ export class SessionScheduler {
             });
         }
     }
-    buildWindow() {
-        if (this.frames.length === 0)
+    buildProvisionalWindow() {
+        if (!this.live)
             return new Int16Array(0);
-        const last = this.frames.at(-1);
-        const utteranceEndMs = last.startMs + FRAME_DURATION_MS;
-        const windowStartMs = Math.max(this.utteranceStartMs, utteranceEndMs - this.maxWindowMs);
+        const utteranceEndMs = this.utteranceEndMs();
+        const windowStartMs = Math.max(this.live.startMs, utteranceEndMs - this.maxWindowMs);
         const overlapStartMs = Math.max(0, windowStartMs - this.overlapMs);
-        const selected = this.frames.filter((frame) => frame.startMs + FRAME_DURATION_MS > overlapStartMs && frame.startMs < utteranceEndMs);
+        return this.collectSamples(overlapStartMs, utteranceEndMs);
+    }
+    collectSamples(fromMs, toMs) {
+        const selected = this.frames.filter((frame) => frame.startMs < toMs && frame.startMs + FRAME_DURATION_MS > fromMs);
         const total = selected.reduce((sum, frame) => sum + frame.samples.length, 0);
         const audio = new Int16Array(total);
         let offset = 0;
@@ -208,16 +270,18 @@ export class SessionScheduler {
         }
         return audio;
     }
-    trimRetainedAudio() {
-        const retainFromMs = Math.max(0, this.utteranceEndMs() - this.overlapMs);
+    trimBuffer() {
+        const retainFromMs = this.speaking && this.live
+            ? Math.max(0, this.live.startMs - this.overlapMs)
+            : Math.max(0, this.utteranceEndMs() - this.overlapMs);
         this.frames = this.frames.filter((frame) => frame.startMs + FRAME_DURATION_MS > retainFromMs);
     }
     utteranceEndMs() {
         const last = this.frames.at(-1);
         return last ? last.startMs + FRAME_DURATION_MS : 0;
     }
-    hasUnfinalizedSpeech() {
-        return this.speechSeen && !this.currentFinalized && !this.finalOutstanding;
+    emitSegment(segment) {
+        this.emitEnvelope({ type: "segment.upsert", segment });
     }
     emitState(state) {
         this.emitEnvelope({ type: "state", state });
