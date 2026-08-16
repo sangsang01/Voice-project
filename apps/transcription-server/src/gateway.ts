@@ -39,6 +39,8 @@ export interface TranscriptionGateway {
   close(): Promise<void>;
 }
 
+const SHUTDOWN_GRACE_MS = 10_000;
+
 interface ConnectionState {
   started: boolean;
   cleaned: boolean;
@@ -48,12 +50,15 @@ interface ConnectionState {
   release: (() => void) | undefined;
   scheduler: SessionScheduler | undefined;
   runtimeSession: StreamingRuntimeSession | undefined;
+  registry: Set<ConnectionState>;
 }
 
 export function createTranscriptionGateway(options: GatewayOptions): Promise<TranscriptionGateway> {
   assertLoopbackBindHost(options.host);
   const capacity = options.capacity ?? 1;
   const pool = new AdmissionPool(capacity);
+  const connections = new Set<ConnectionState>();
+  const control = { admitting: true };
 
   return new Promise((resolve, reject) => {
     const wss = new WebSocketServer({
@@ -63,7 +68,7 @@ export function createTranscriptionGateway(options: GatewayOptions): Promise<Tra
         return protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false;
       },
       verifyClient(info: { origin: string; secure: boolean; req: IncomingMessage }) {
-        return options.allowedOrigins.includes(info.origin) && hasRequiredSubprotocol(info.req);
+        return control.admitting && options.allowedOrigins.includes(info.origin) && hasRequiredSubprotocol(info.req);
       },
     });
 
@@ -80,22 +85,23 @@ export function createTranscriptionGateway(options: GatewayOptions): Promise<Tra
       }
 
       wss.on("connection", (socket) => {
-        bindConnection(socket, options, pool, capacity);
+        if (!control.admitting) {
+          socket.close(1001, "server shutting down");
+          return;
+        }
+        bindConnection(socket, options, pool, capacity, connections);
       });
 
       resolve({
         host: address.address,
         port: address.port,
-        close: () => closeGateway(wss),
+        close: () => closeGateway(wss, control, connections),
       });
     });
   });
 }
 
-function closeGateway(wss: WebSocketServer): Promise<void> {
-  for (const client of wss.clients) {
-    client.close(1001, "server shutting down");
-  }
+function closeHttp(wss: WebSocketServer): Promise<void> {
   return new Promise((resolve, reject) => {
     wss.close((error) => {
       if (error) reject(error);
@@ -104,11 +110,34 @@ function closeGateway(wss: WebSocketServer): Promise<void> {
   });
 }
 
+async function closeGateway(
+  wss: WebSocketServer,
+  control: { admitting: boolean },
+  connections: Set<ConnectionState>,
+): Promise<void> {
+  control.admitting = false;
+  const pending = [...connections].map((state) => finish(state, true));
+  for (const client of wss.clients) {
+    client.close(1001, "server shutting down");
+  }
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  const grace = new Promise<void>((resolve) => {
+    graceTimer = setTimeout(resolve, SHUTDOWN_GRACE_MS);
+  });
+  try {
+    await Promise.race([Promise.all(pending), grace]);
+  } finally {
+    if (graceTimer !== undefined) clearTimeout(graceTimer);
+  }
+  await closeHttp(wss);
+}
+
 function bindConnection(
   socket: WebSocket,
   options: GatewayOptions,
   pool: AdmissionPool,
   capacity: number,
+  connections: Set<ConnectionState>,
 ): void {
   const state: ConnectionState = {
     started: false,
@@ -119,7 +148,9 @@ function bindConnection(
     release: undefined,
     scheduler: undefined,
     runtimeSession: undefined,
+    registry: connections,
   };
+  connections.add(state);
 
   let chain = Promise.resolve();
 
@@ -279,6 +310,7 @@ async function handleBinary(socket: WebSocket, state: ConnectionState, data: Raw
 async function finish(state: ConnectionState, cancelIfActive: boolean): Promise<void> {
   if (state.cleaned) return;
   state.cleaned = true;
+  state.registry.delete(state);
   try {
     if (cancelIfActive) await state.scheduler?.cancel();
   } finally {

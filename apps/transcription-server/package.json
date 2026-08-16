@@ -11,6 +11,7 @@
     "dev": "node dist/main.js"
   },
   "dependencies": {
+    "@voice/native-whisper-addon": "*",
     "@voice/streaming-protocol": "0.0.0",
     "@voice/transcription-contracts": "0.0.0",
     "ws": "8.18.3"
