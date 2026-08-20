@@ -20,6 +20,15 @@ const defaultLocalEngine = vi.hoisted(() => ({
   dispose: vi.fn(async () => undefined),
 }));
 
+const defaultRemoteEngine = vi.hoisted(() => ({
+  created: 0,
+  options: [] as Array<{ endpoint: string; tokenProvider?: () => Promise<string> | string }>,
+  inspect: vi.fn(async () => ({ available: true })),
+  prepare: vi.fn(async () => undefined),
+  open: vi.fn(),
+  dispose: vi.fn(async () => undefined),
+}));
+
 vi.mock("@voice/local-whisper-engine", () => ({
   LocalWhisperEngine: class {
     public readonly inspect = defaultLocalEngine.inspect;
@@ -31,6 +40,20 @@ vi.mock("@voice/local-whisper-engine", () => ({
       defaultLocalEngine.created += 1;
       defaultLocalEngine.onProgress = options.onProgress;
       defaultLocalEngine.onProgressCallbacks.push(options.onProgress);
+    }
+  },
+}));
+
+vi.mock("@voice/remote-whisper-engine", () => ({
+  RemoteWhisperEngine: class {
+    public readonly inspect = defaultRemoteEngine.inspect;
+    public readonly prepare = defaultRemoteEngine.prepare;
+    public readonly open = defaultRemoteEngine.open;
+    public readonly dispose = defaultRemoteEngine.dispose;
+
+    public constructor(options: { endpoint: string; tokenProvider?: () => Promise<string> | string }) {
+      defaultRemoteEngine.created += 1;
+      defaultRemoteEngine.options.push(options);
     }
   },
 }));
@@ -280,6 +303,108 @@ describe("TranscriptionAdapter", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Standby");
   });
 
+  it("defaults to RemoteWhisperEngine and Online real-time when the websocket URL is configured", async () => {
+    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "wss://transcription.example/ws");
+    defaultLocalEngine.created = 0;
+    defaultRemoteEngine.created = 0;
+    defaultRemoteEngine.options = [];
+    defaultRemoteEngine.inspect.mockResolvedValue({ available: true });
+    defaultRemoteEngine.prepare.mockResolvedValue(undefined);
+    defaultRemoteEngine.open.mockImplementation(async () => {
+      throw new Error("open should not be required for this construction check");
+    });
+    defaultRemoteEngine.dispose.mockResolvedValue(undefined);
+
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} microphoneFactory={async () => ({ stop: vi.fn(async () => undefined) })} />);
+
+    expect(screen.getByRole("button", { name: "Online real-time" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Offline local" })).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultRemoteEngine.created).toBe(1));
+    expect(defaultRemoteEngine.options[0]?.endpoint).toBe("wss://transcription.example/ws");
+    expect(defaultLocalEngine.created).toBe(0);
+    vi.unstubAllEnvs();
+  });
+
+  it("disables Online real-time when no WebSocket URL is configured", () => {
+    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "");
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} microphoneFactory={async () => ({ stop: vi.fn(async () => undefined) })} />);
+    expect(screen.getByRole("button", { name: "Online real-time" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Offline local" })).toHaveAttribute("aria-pressed", "true");
+    vi.unstubAllEnvs();
+  });
+
+  it("evicts a cached remote engine when switching to Offline local", async () => {
+    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "wss://transcription.example/ws");
+    defaultLocalEngine.created = 0;
+    defaultRemoteEngine.created = 0;
+    defaultRemoteEngine.dispose.mockClear();
+    defaultLocalEngine.dispose.mockClear();
+
+    const remoteListeners = new Set<(event: EngineEvent) => void>();
+    let remoteSessionId = "remote-session";
+    const remoteSession = {
+      push: vi.fn(() => ({ accepted: true as const })),
+      stop: vi.fn(async () => {
+        for (const listener of remoteListeners) {
+          listener({ type: "state", sessionId: remoteSessionId, sequence: 1, state: "stopped" });
+        }
+      }),
+      cancel: vi.fn(async () => undefined),
+      subscribe: vi.fn((listener: (event: EngineEvent) => void) => {
+        remoteListeners.add(listener);
+        listener({ type: "state", sessionId: remoteSessionId, sequence: 0, state: "listening" });
+        return () => remoteListeners.delete(listener);
+      }),
+    };
+    defaultRemoteEngine.inspect.mockResolvedValue({ available: true });
+    defaultRemoteEngine.prepare.mockResolvedValue(undefined);
+    defaultRemoteEngine.open.mockImplementation(async (request?: SessionRequest) => {
+      remoteSessionId = request?.sessionId ?? "remote-session";
+      return remoteSession;
+    });
+    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
+    defaultLocalEngine.prepare.mockResolvedValue(undefined);
+    defaultLocalEngine.open.mockImplementation(async (request?: SessionRequest) => {
+      const localSessionId = request?.sessionId ?? "local-session";
+      const localListeners = new Set<(event: EngineEvent) => void>();
+      return {
+        push: vi.fn(() => ({ accepted: true as const })),
+        stop: vi.fn(async () => {
+          for (const listener of localListeners) {
+            listener({ type: "state", sessionId: localSessionId, sequence: 1, state: "stopped" });
+          }
+        }),
+        cancel: vi.fn(async () => undefined),
+        subscribe: vi.fn((listener: (event: EngineEvent) => void) => {
+          localListeners.add(listener);
+          listener({ type: "state", sessionId: localSessionId, sequence: 0, state: "listening" });
+          return () => localListeners.delete(listener);
+        }),
+      };
+    });
+
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} microphoneFactory={async () => ({ stop: vi.fn(async () => undefined) })} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultRemoteEngine.created).toBe(1));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Listening"));
+    expect(defaultLocalEngine.created).toBe(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Standby"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Offline local" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Offline local" })).toHaveAttribute("aria-pressed", "true"));
+    await waitFor(() => expect(defaultRemoteEngine.dispose).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultLocalEngine.created).toBe(1));
+    expect(defaultRemoteEngine.created).toBe(1);
+    vi.unstubAllEnvs();
+  });
+
   it("renders provisional and final segments with language badges and model progress", async () => {
     const { engine } = renderAdapter();
     fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
@@ -294,15 +419,33 @@ describe("TranscriptionAdapter", () => {
         id: "s1", ordinal: 1, revision: 1, startMs: 0, endMs: 200, text: "Hello", language: { tag: "en-US" }, isFinal: false,
       },
     });
+
+    const provisional = await screen.findByText("Hello");
+    const provisionalSegment = provisional.closest("p");
+    expect(provisionalSegment).toHaveClass("transcript-segment--provisional");
+    expect(provisionalSegment).toHaveAttribute("data-final", "false");
+    expect(provisionalSegment).toHaveTextContent("Updating");
+    expect(document.querySelector(".transcript")).toHaveAttribute("aria-live", "off");
+    const politeRegion = document.querySelector(".visually-hidden[aria-live='polite']");
+    expect(politeRegion).not.toBeNull();
+    expect(politeRegion).not.toHaveTextContent("Hello");
+
     engine.session.emit({
       type: "segment.upsert", sequence: 3, segment: {
         id: "s1", ordinal: 1, revision: 2, startMs: 0, endMs: 300, text: "Hello world", language: { tag: "en-US" }, isFinal: true,
       },
     });
 
-    expect(await screen.findByText("Hello world")).toBeInTheDocument();
-    expect(screen.getByText("en-US")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(document.querySelectorAll(".transcript p[data-final='true']")).toHaveLength(1);
+    });
+    const finalSegment = document.querySelector(".transcript p[data-final='true']");
+    expect(finalSegment).toHaveTextContent("Hello world");
+    expect(finalSegment).toHaveTextContent("en-US");
+    expect(finalSegment).not.toHaveClass("transcript-segment--provisional");
     expect(screen.getByRole("status")).toHaveTextContent("Listening");
+    expect(screen.getAllByText("Hello world")).toHaveLength(2);
+    expect(politeRegion).toHaveTextContent("Hello world");
   });
 
   it("warns on backpressure and ignores stale events after clear and restart", async () => {
@@ -313,7 +456,7 @@ describe("TranscriptionAdapter", () => {
     await waitFor(() => expect(engine.open).toHaveBeenCalled());
     engine.session.rejectNextFrame = true;
     emitFrame(frame(0));
-    expect(await screen.findByText(/Audio is arriving faster/)).toBeInTheDocument();
+    expect(await screen.findByText(/Audio is arriving faster than the transcription service/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Clear & Restart" }));
     await waitFor(() => expect(engine.session.cancel).toHaveBeenCalled());

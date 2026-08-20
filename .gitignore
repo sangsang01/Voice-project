@@ -7,3 +7,5 @@ dist/
 .claude/
 .worktrees/
 apps/web/public/models/
+apps/transcription-server/models/
+apps/transcription-server/benchmark-results/

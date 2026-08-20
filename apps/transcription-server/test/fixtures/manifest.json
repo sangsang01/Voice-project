@@ -1,0 +1,55 @@
+{
+  "models": {
+    "small": {
+      "file": "ggml-small.bin",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+      "sha256": "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+    },
+    "medium": {
+      "file": "ggml-medium.bin",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+      "sha256": "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208"
+    },
+    "silero": {
+      "file": "ggml-silero-v6.2.0.bin",
+      "url": "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin",
+      "sha256": "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
+    }
+  },
+  "benchmarkSessions": [
+    {
+      "id": "en",
+      "language": "en-US",
+      "referenceText": "and so my fellow americans ask not what your country can do for you ask what you can do for your country",
+      "pcmFixture": "synthetic-en"
+    },
+    {
+      "id": "vi",
+      "language": "vi-VN",
+      "referenceText": "xin chao viet nam",
+      "pcmFixture": "synthetic-vi"
+    },
+    {
+      "id": "es",
+      "language": "es-ES",
+      "referenceText": "hola como estas",
+      "pcmFixture": "synthetic-es"
+    },
+    {
+      "id": "zh",
+      "language": "zh-CN",
+      "referenceText": "你好世界",
+      "pcmFixture": "synthetic-zh"
+    }
+  ],
+  "gates": {
+    "firstPartialP95Ms": 1500,
+    "refreshP95Ms": 1000,
+    "finalAfterSilenceP95Ms": 1500,
+    "realTimeFactor": 0.5
+  },
+  "accuracyRegression": {
+    "aggregateAbsolutePoints": 1,
+    "perLanguageAbsolutePoints": 2
+  }
+}

@@ -232,7 +232,130 @@ test("fake microphone starts and stops without loading a real model", async ({ p
   await page.getByRole("button", { name: "Stop" }).click();
 
   await expect(page.getByRole("status")).toContainText("Standby");
-  await expect(page.getByText("synthetic final")).toBeVisible();
+  await expect(page.locator(".transcript")).toContainText("synthetic final");
+});
+
+test("partial revisions replace one segment before final text", async ({ page }) => {
+  await page.addInitScript(() => {
+    type Listener = (event: MessageEvent<unknown>) => void;
+
+    class FakeNode {
+      public connect() { return this; }
+      public disconnect() { /* Browser cleanup is intentionally harmless in the fake graph. */ }
+    }
+
+    class FakeAudioWorkletNode extends FakeNode {
+      public port: { onmessage: Listener | null } = { onmessage: null };
+      public constructor() { super(); }
+    }
+
+    class FakeAudioContext {
+      public audioWorklet = { addModule: async () => undefined };
+      public destination = new FakeNode();
+      public async resume() { /* no-op */ }
+      public async close() { /* no-op */ }
+      public createMediaStreamSource() { return new FakeNode(); }
+    }
+
+    Object.defineProperty(window, "AudioContext", { configurable: true, value: FakeAudioContext });
+    Object.defineProperty(window, "AudioWorkletNode", { configurable: true, value: FakeAudioWorkletNode });
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: async () => ({ getTracks: () => [{ stop() { /* no-op */ } }] }) },
+    });
+
+    class FakeRemoteSession {
+      private readonly listeners = new Set<(event: Record<string, unknown>) => void>();
+      public sessionId = "remote-session";
+      public readonly stop = async () => {
+        this.emit({ type: "state", state: "stopped" });
+      };
+      public readonly cancel = async () => undefined;
+      public push() { return { accepted: true as const }; }
+      public subscribe(listener: (event: Record<string, unknown>) => void) {
+        this.listeners.add(listener);
+        listener({ type: "state", sessionId: this.sessionId, sequence: 0, state: "listening" });
+        return () => this.listeners.delete(listener);
+      }
+
+      public emitRevision(input: { text: string; revision: number; endMs: number; isFinal: boolean }) {
+        this.emit({
+          type: "segment.upsert",
+          segment: {
+            id: "booking",
+            ordinal: 0,
+            revision: input.revision,
+            startMs: 0,
+            endMs: input.endMs,
+            text: input.text,
+            language: { tag: "en-US" },
+            isFinal: input.isFinal,
+          },
+        });
+      }
+
+      private sequence = 0;
+      private emit(event: Record<string, unknown>) {
+        this.sequence += 1;
+        for (const listener of this.listeners) {
+          listener({ ...event, sessionId: this.sessionId, sequence: this.sequence });
+        }
+      }
+    }
+
+    class FakeRemoteEngine {
+      public readonly session = new FakeRemoteSession();
+      public async inspect() { return { available: true }; }
+      public async prepare() { return undefined; }
+      public async open(request: { sessionId: string }) {
+        this.session.sessionId = request.sessionId;
+        (window as Window & { __emitPartialRevision?: FakeRemoteSession["emitRevision"] }).__emitPartialRevision =
+          (input) => this.session.emitRevision(input);
+        return this.session;
+      }
+      public async dispose() { return undefined; }
+    }
+
+    Object.defineProperty(window, "__transcriptionEngineFactory", {
+      configurable: true,
+      value: () => new FakeRemoteEngine(),
+    });
+  });
+
+  await page.goto("/");
+  await selectEnglishAndStart(page);
+
+  const segments = page.locator(".transcript p[data-final]");
+  const segmentText = page.locator(".transcript p[data-final] > span").first();
+
+  await page.evaluate(() => {
+    (window as Window & { __emitPartialRevision?: (input: { text: string; revision: number; endMs: number; isFinal: boolean }) => void })
+      .__emitPartialRevision?.({ text: "I would", revision: 0, endMs: 200, isFinal: false });
+  });
+  await expect(segments).toHaveCount(1);
+  await expect(segments).toHaveAttribute("data-final", "false");
+  await expect(segmentText).toHaveText("I would");
+
+  await page.evaluate(() => {
+    (window as Window & { __emitPartialRevision?: (input: { text: string; revision: number; endMs: number; isFinal: boolean }) => void })
+      .__emitPartialRevision?.({ text: "I would like", revision: 1, endMs: 400, isFinal: false });
+  });
+  await expect(segments).toHaveCount(1);
+  await expect(segmentText).toHaveText("I would like");
+  await expect(segments).toHaveAttribute("data-final", "false");
+
+  await page.evaluate(() => {
+    (window as Window & { __emitPartialRevision?: (input: { text: string; revision: number; endMs: number; isFinal: boolean }) => void })
+      .__emitPartialRevision?.({ text: "I would like to reserve a room.", revision: 2, endMs: 800, isFinal: true });
+  });
+  await expect(segments).toHaveCount(1);
+  await expect(segmentText).toHaveText("I would like to reserve a room.");
+  await expect(segments).toHaveAttribute("data-final", "true");
+  await expect(page.getByRole("status")).toContainText("Listening");
+
+  await page.getByRole("button", { name: "Stop" }).click();
+  await expect(page.getByRole("status")).toContainText("Standby");
+  await expect(page.locator(".transcript")).toContainText("I would like to reserve a room.");
 });
 
 test("rapid clear and restart drops stale transcript events", async ({ page }) => {
@@ -288,7 +411,7 @@ test("benchmark: reports synthetic transcription UI lifecycle timings", async ({
   await expect(page.getByText("synthetic provisional")).toBeVisible();
   const firstProvisionalUiMs = Math.round(performance.now() - startedAt);
   await page.getByRole("button", { name: "Stop" }).click();
-  await expect(page.getByText("synthetic final")).toBeVisible();
+  await expect(page.locator('.transcript [data-final="true"]', { hasText: "synthetic final" })).toBeVisible();
   const finalUiMs = Math.round(performance.now() - startedAt);
 
   const timings = {
