@@ -1,0 +1,26 @@
+{
+  "name": "@voice/transcription-server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit --pretty false",
+    "dev": "node dist/main.js",
+    "fetch-models": "node scripts/fetch-server-models.mjs",
+    "benchmark": "node scripts/benchmark.mjs"
+  },
+  "dependencies": {
+    "@voice/native-whisper-addon": "*",
+    "@voice/streaming-protocol": "0.0.0",
+    "@voice/transcription-contracts": "0.0.0",
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.10"
+  }
+}

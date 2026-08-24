@@ -219,27 +219,176 @@ async function installRealBridgeMicrophoneSeam(page: Page) {
   });
 }
 
+async function installLiveWebSocketFake(page: Page) {
+  await page.addInitScript(() => {
+    class FakeWebSocket {
+      public static readonly CONNECTING = 0;
+      public static readonly OPEN = 1;
+      public static readonly CLOSING = 2;
+      public static readonly CLOSED = 3;
+      public readyState = FakeWebSocket.CONNECTING;
+      public bufferedAmount = 0;
+      public binaryType: BinaryType = "blob";
+      public protocol = "";
+      public readonly url: string;
+      public readonly protocols: string[];
+      private readonly listeners = new Map<string, Set<(event: Event) => void>>();
+      private eventSequence = 0;
+      private sessionId = "";
+      private readonly segmentId = "live-caption";
+
+      public constructor(url: string, protocols: string | string[] = []) {
+        this.url = url;
+        this.protocols = typeof protocols === "string" ? [protocols] : [...protocols];
+        const recorded = (window as Window & { __liveWsProtocols?: string[] }).__liveWsProtocols ?? [];
+        (window as Window & { __liveWsProtocols: string[] }).__liveWsProtocols = [...recorded, ...this.protocols];
+        queueMicrotask(() => {
+          this.readyState = FakeWebSocket.OPEN;
+          this.protocol = this.protocols.includes("voice-transcription.v1") ? "voice-transcription.v1" : "";
+          this.emit("open", new Event("open"));
+        });
+      }
+
+      public addEventListener(type: string, listener: (event: Event) => void) {
+        const set = this.listeners.get(type) ?? new Set<(event: Event) => void>();
+        set.add(listener);
+        this.listeners.set(type, set);
+      }
+
+      public removeEventListener(type: string, listener: (event: Event) => void) {
+        this.listeners.get(type)?.delete(listener);
+      }
+
+      public send(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+        if (typeof data !== "string") {
+          const buffer = arrayBufferOf(data);
+          if (!buffer || !this.sessionId) return;
+          const sequence = new DataView(buffer).getUint32(4, true);
+          queueMicrotask(() => {
+            this.emitMessage({ type: "audio.ack", sessionId: this.sessionId, throughSequence: sequence });
+          });
+          return;
+        }
+
+        const message = JSON.parse(data) as {
+          type?: string;
+          sessionId?: string;
+          request?: { sessionId?: string };
+        };
+        if (message.type === "session.start" && message.request?.sessionId) {
+          this.sessionId = message.request.sessionId;
+          queueMicrotask(() => {
+            this.emitMessage({
+              type: "session.accepted",
+              sessionId: this.sessionId,
+              model: "small",
+              backend: "cpu",
+            });
+            this.emitEngine({ type: "state", sessionId: this.sessionId, sequence: this.nextSequence(), state: "listening" });
+            this.emitCaption(0, "I would", false);
+            window.setTimeout(() => {
+              if (this.readyState !== FakeWebSocket.OPEN) return;
+              this.emitCaption(1, "I would like", false);
+            }, 40);
+          });
+          return;
+        }
+
+        if ((message.type === "session.stop" || message.type === "session.cancel") && message.sessionId) {
+          queueMicrotask(() => {
+            if (message.type === "session.stop") {
+              this.emitCaption(2, "I would like to reserve a room.", true);
+            }
+            this.emitEngine({ type: "state", sessionId: message.sessionId, sequence: this.nextSequence(), state: "stopped" });
+          });
+        }
+      }
+
+      public close() {
+        if (this.readyState === FakeWebSocket.CLOSED) return;
+        this.readyState = FakeWebSocket.CLOSED;
+        this.emit("close", new CloseEvent("close", { code: 1000, reason: "" }));
+      }
+
+      private nextSequence() {
+        const sequence = this.eventSequence;
+        this.eventSequence += 1;
+        return sequence;
+      }
+
+      private emitCaption(revision: number, text: string, isFinal: boolean) {
+        this.emitEngine({
+          type: "segment.upsert",
+          sessionId: this.sessionId,
+          sequence: this.nextSequence(),
+          segment: {
+            id: this.segmentId,
+            ordinal: 0,
+            revision,
+            startMs: 0,
+            endMs: 400 + revision * 200,
+            text,
+            language: { tag: "en-US" },
+            isFinal,
+          },
+        });
+      }
+
+      private emitEngine(event: Record<string, unknown>) {
+        this.emitMessage({ type: "engine.event", event });
+      }
+
+      private emitMessage(value: unknown) {
+        this.emit("message", new MessageEvent("message", { data: JSON.stringify(value) }));
+      }
+
+      private emit(type: string, event: Event) {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+    }
+
+    function arrayBufferOf(data: ArrayBufferLike | Blob | ArrayBufferView): ArrayBuffer | undefined {
+      if (data instanceof ArrayBuffer) return data;
+      if (ArrayBuffer.isView(data)) {
+        return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+      }
+      return undefined;
+    }
+
+    Object.defineProperty(window, "WebSocket", { configurable: true, value: FakeWebSocket });
+  });
+}
+
+async function chooseOfflineLocal(page: Page) {
+  await page.getByRole("button", { name: "Offline local" }).click();
+}
+
 async function selectEnglishAndStart(page: Page, timeout = 5_000) {
   await page.getByRole("button", { name: "Start", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("Listening", { timeout });
+}
+
+async function startOfflineSession(page: Page, timeout = 5_000) {
+  await chooseOfflineLocal(page);
+  await selectEnglishAndStart(page, timeout);
 }
 
 test("fake microphone starts and stops without loading a real model", async ({ page }) => {
   await installBrowserFakes(page);
   await page.goto("/");
 
-  await selectEnglishAndStart(page);
+  await startOfflineSession(page);
   await page.getByRole("button", { name: "Stop" }).click();
 
   await expect(page.getByRole("status")).toContainText("Standby");
-  await expect(page.getByText("synthetic final")).toBeVisible();
+  await expect(page.locator(".transcript").getByText("synthetic final")).toBeVisible();
 });
 
 test("rapid clear and restart drops stale transcript events", async ({ page }) => {
   await installBrowserFakes(page);
   await page.goto("/");
 
-  await selectEnglishAndStart(page);
+  await startOfflineSession(page);
   await page.getByRole("button", { name: "Clear & Restart" }).click();
 
   await expect(page.getByRole("status")).toContainText("Listening");
@@ -250,6 +399,7 @@ test("permission denial leaves the session stopped with an actionable error", as
   await installBrowserFakes(page, "permission-denied");
   await page.goto("/");
 
+  await chooseOfflineLocal(page);
   await page.getByRole("button", { name: "Start", exact: true }).click();
 
   await expect(page.getByRole("alert")).toContainText("Microphone permission was denied");
@@ -260,6 +410,7 @@ test("a worker crash is surfaced without accepting a transcript", async ({ page 
   await installBrowserFakes(page, "worker-crash");
   await page.goto("/");
 
+  await chooseOfflineLocal(page);
   await page.getByRole("button", { name: "Start", exact: true }).click();
 
   await expect(page.getByRole("alert")).toContainText("local Whisper worker failed");
@@ -270,11 +421,11 @@ test("a worker crash is surfaced without accepting a transcript", async ({ page 
 test("a reload reuses the fake cached local model path", async ({ page }) => {
   await installBrowserFakes(page);
   await page.goto("/");
-  await selectEnglishAndStart(page);
+  await startOfflineSession(page);
   await expect.poll(() => page.evaluate(() => localStorage.getItem("fake-local-model-prepares"))).toBe("1");
 
   await page.reload();
-  await selectEnglishAndStart(page);
+  await startOfflineSession(page);
 
   await expect.poll(() => page.evaluate(() => localStorage.getItem("fake-local-model-prepares"))).toBe("2");
   await expect.poll(() => page.evaluate(() => (window as Window & { __transcriptionE2e: { cacheHits: number } }).__transcriptionE2e.cacheHits)).toBe(1);
@@ -284,11 +435,11 @@ test("benchmark: reports synthetic transcription UI lifecycle timings", async ({
   await installBrowserFakes(page);
   await page.goto("/");
   const startedAt = performance.now();
-  await selectEnglishAndStart(page);
-  await expect(page.getByText("synthetic provisional")).toBeVisible();
+  await startOfflineSession(page);
+  await expect(page.locator(".transcript").getByText("synthetic provisional")).toBeVisible();
   const firstProvisionalUiMs = Math.round(performance.now() - startedAt);
   await page.getByRole("button", { name: "Stop" }).click();
-  await expect(page.getByText("synthetic final")).toBeVisible();
+  await expect(page.locator(".transcript").getByText("synthetic final")).toBeVisible();
   const finalUiMs = Math.round(performance.now() - startedAt);
 
   const timings = {
@@ -314,6 +465,7 @@ test("transcribes the JFK fixture through the real browser worker, VAD, and whis
 
   let started = false;
   try {
+    await chooseOfflineLocal(page);
     await page.getByRole("button", { name: "Start", exact: true }).click();
     started = true;
     await expect(page.getByRole("status")).toContainText("Listening", { timeout: 45_000 });
@@ -348,4 +500,34 @@ test("transcribes the JFK fixture through the real browser worker, VAD, and whis
       await page.getByRole("button", { name: "Stop" }).click();
     }
   }
+});
+
+test.describe("live localhost captions", () => {
+  test("revises one live caption in place until stop finalizes it", async ({ page }) => {
+    await installBrowserFakes(page);
+    await installLiveWebSocketFake(page);
+    await page.goto("/");
+
+    await expect(page.getByRole("button", { name: "Live (this PC)" })).toHaveAttribute("aria-pressed", "true");
+    await selectEnglishAndStart(page);
+
+    const protocols = await page.evaluate(() => (window as Window & { __liveWsProtocols?: string[] }).__liveWsProtocols ?? []);
+    expect(protocols).toContain("voice-transcription.v1");
+
+    const caption = page.locator(".transcript [data-final]");
+    await expect(caption).toHaveCount(1);
+    await expect(caption).toHaveAttribute("data-final", "false");
+    await expect(caption).toContainText("I would");
+    await expect(page.locator(".transcript-updating")).toBeVisible();
+
+    await expect(caption).toHaveCount(1);
+    await expect(caption).toContainText("I would like");
+    await expect(page.locator(".transcript-updating")).toBeVisible();
+
+    await page.getByRole("button", { name: "Stop" }).click();
+    await expect(caption).toHaveCount(1);
+    await expect(caption).toHaveAttribute("data-final", "true");
+    await expect(caption).toContainText("I would like to reserve a room.");
+    await expect(page.getByRole("status")).toContainText("Standby");
+  });
 });

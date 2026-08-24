@@ -1,3 +1,4 @@
 # TypeScript emits committed package build artifacts with LF on every platform.
 packages/local-whisper-engine/dist/** text eol=lf
 packages/transcription-contracts/dist/** text eol=lf
+packages/native-whisper-addon/dist/** text eol=lf

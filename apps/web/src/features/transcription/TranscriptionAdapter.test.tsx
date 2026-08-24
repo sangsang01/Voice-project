@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type {
   EngineEvent,
   EngineEventListener,
@@ -8,7 +8,7 @@ import type {
   TranscriptionEngine,
   TranscriptionSession,
 } from "@voice/transcription-contracts";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const defaultLocalEngine = vi.hoisted(() => ({
   created: 0,
@@ -31,6 +31,29 @@ vi.mock("@voice/local-whisper-engine", () => ({
       defaultLocalEngine.created += 1;
       defaultLocalEngine.onProgress = options.onProgress;
       defaultLocalEngine.onProgressCallbacks.push(options.onProgress);
+    }
+  },
+}));
+
+const defaultRemoteEngine = vi.hoisted(() => ({
+  created: 0,
+  endpoints: [] as string[],
+  inspect: vi.fn(async () => ({ available: true })),
+  prepare: vi.fn(async () => undefined),
+  open: vi.fn(),
+  dispose: vi.fn(async () => undefined),
+}));
+
+vi.mock("@voice/remote-whisper-engine", () => ({
+  RemoteWhisperEngine: class {
+    public readonly inspect = defaultRemoteEngine.inspect;
+    public readonly prepare = defaultRemoteEngine.prepare;
+    public readonly open = defaultRemoteEngine.open;
+    public readonly dispose = defaultRemoteEngine.dispose;
+
+    public constructor(options: { endpoint: string }) {
+      defaultRemoteEngine.created += 1;
+      defaultRemoteEngine.endpoints.push(options.endpoint);
     }
   },
 }));
@@ -105,7 +128,17 @@ function renderAdapter(options: { engine?: ControlledEngine; failMicrophone?: bo
   return { engine, microphone, emitFrame: (nextFrame: PcmFrame) => onFrame?.(nextFrame) };
 }
 
+async function startOfflineLocal() {
+  fireEvent.click(screen.getByRole("button", { name: "Offline local" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Start" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Start" }));
+}
+
 describe("TranscriptionAdapter", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("validates selection to one through four unique languages", () => {
     renderAdapter();
 
@@ -175,7 +208,7 @@ describe("TranscriptionAdapter", () => {
     defaultLocalEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
     render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await startOfflineLocal();
     expect(await screen.findByRole("status")).toHaveTextContent("Preparing");
     await waitFor(() => expect(defaultLocalEngine.onProgress).toEqual(expect.any(Function)));
     act(() => defaultLocalEngine.onProgress?.(0.42));
@@ -199,7 +232,7 @@ describe("TranscriptionAdapter", () => {
       .mockImplementationOnce(() => new Promise<never>(() => undefined));
     render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await startOfflineLocal();
     await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole("button", { name: "Clear & Restart" }));
     await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(2));
@@ -227,7 +260,7 @@ describe("TranscriptionAdapter", () => {
     defaultLocalEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
     render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await startOfflineLocal();
     await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole("button", { name: "Clear & Restart" }));
     await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(2));
@@ -300,7 +333,7 @@ describe("TranscriptionAdapter", () => {
       },
     });
 
-    expect(await screen.findByText("Hello world")).toBeInTheDocument();
+    expect(await within(document.querySelector(".transcript") as HTMLElement).findByText("Hello world")).toBeVisible();
     expect(screen.getByText("en-US")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Listening");
   });
@@ -345,5 +378,80 @@ describe("TranscriptionAdapter", () => {
 
     view.unmount();
     await waitFor(() => expect(engine.dispose).toHaveBeenCalledTimes(1));
+  });
+
+  it("creates the remote engine by default when a live endpoint is configured", async () => {
+    defaultLocalEngine.created = 0;
+    defaultRemoteEngine.created = 0;
+    defaultRemoteEngine.endpoints = [];
+    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "ws://127.0.0.1:8787");
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
+
+    expect(screen.getByRole("button", { name: "Live (this PC)" })).toBeInTheDocument();
+    expect(document.querySelector(".engine-mode")).toHaveTextContent("Live (this PC)");
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultRemoteEngine.created).toBe(1));
+    expect(defaultLocalEngine.created).toBe(0);
+    expect(defaultRemoteEngine.endpoints).toEqual(["ws://127.0.0.1:8787"]);
+  });
+
+  it("creates the local engine after switching from Live to Offline local", async () => {
+    defaultLocalEngine.created = 0;
+    defaultRemoteEngine.created = 0;
+    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "ws://127.0.0.1:8787");
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Offline local" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start" })).toBeEnabled());
+    expect(document.querySelector(".engine-mode")).toHaveTextContent("Offline local");
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultLocalEngine.created).toBe(1));
+    expect(defaultRemoteEngine.created).toBe(0);
+  });
+
+  it("replaces a provisional caption in place and keeps finalized text in a polite live region", async () => {
+    const { engine } = renderAdapter();
+    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(engine.open).toHaveBeenCalled());
+
+    engine.session.emit({
+      type: "segment.upsert", sequence: 1, segment: {
+        id: "caption-1", ordinal: 1, revision: 0, startMs: 0, endMs: 200, text: "Hello", language: { tag: "en-US" }, isFinal: false,
+      },
+    });
+
+    const transcript = document.querySelector(".transcript");
+    expect(transcript).toHaveAttribute("aria-live", "off");
+    const provisional = await waitFor(() => {
+      const paragraph = transcript?.querySelector("p");
+      expect(paragraph).toHaveClass("transcript-segment--provisional");
+      return paragraph as HTMLElement;
+    });
+    expect(provisional).toHaveAttribute("data-final", "false");
+    expect(provisional).toHaveTextContent(/Hello/);
+    expect(provisional).toHaveTextContent(/Updating/);
+    const liveRegion = document.querySelector(".visually-hidden");
+    expect(liveRegion).toHaveAttribute("aria-live", "polite");
+    expect(liveRegion).not.toHaveTextContent("Hello");
+
+    engine.session.emit({
+      type: "segment.upsert", sequence: 2, segment: {
+        id: "caption-1", ordinal: 1, revision: 1, startMs: 0, endMs: 300, text: "Hello world", language: { tag: "en-US" }, isFinal: true,
+      },
+    });
+
+    await waitFor(() => {
+      expect(transcript?.querySelectorAll("[data-final]")).toHaveLength(1);
+      expect(transcript?.querySelector("p")).toHaveAttribute("data-final", "true");
+    });
+    const finalParagraph = transcript?.querySelector("p");
+    expect(finalParagraph).toHaveAttribute("data-final", "true");
+    expect(finalParagraph).toHaveTextContent("Hello world");
+    expect(finalParagraph).not.toHaveClass("transcript-segment--provisional");
+    expect(screen.queryByText(/Updating/)).not.toBeInTheDocument();
+    expect(liveRegion).toHaveTextContent("Hello world");
   });
 });
