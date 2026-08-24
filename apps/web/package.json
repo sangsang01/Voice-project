@@ -11,6 +11,7 @@
     "test:e2e": "playwright test --config playwright.config.ts",
     "benchmark": "playwright test --config playwright.config.ts --grep benchmark",
     "typecheck": "tsc -b --pretty false",
+    "test:typecheck": "tsc -p tsconfig.test.json --pretty false",
     "lint": "eslint . --max-warnings=0"
   },
   "dependencies": {
