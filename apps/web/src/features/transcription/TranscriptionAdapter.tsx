@@ -6,7 +6,7 @@ import { SessionController, type EngineFactory, type MicrophoneFactory } from ".
 import { createSessionState, sessionReducer } from "./sessionReducer";
 
 const LANGUAGES = [["en-US", "English"], ["vi-VN", "Vietnamese"], ["es-ES", "Spanish"]] as const;
-const LANGUAGE_TAGS = new Set(LANGUAGES.map(([tag]) => tag));
+const LANGUAGE_TAGS: ReadonlySet<string> = new Set(LANGUAGES.map(([tag]) => tag));
 interface TranscriptionAdapterProps { initialLanguages?: readonly string[]; engineFactory?: EngineFactory; microphoneFactory?: MicrophoneFactory; }
 
 function createEngine(): TranscriptionEngine {
