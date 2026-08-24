@@ -964,6 +964,26 @@ describe("SessionController inspection cancellation", () => {
     expect(engine.open).toHaveBeenCalledTimes(1);
   });
 
+  it("retires and reports a synchronous microphone factory failure", async () => {
+    const engine = new PendingInspectionEngine();
+    engine.inspect.mockResolvedValue({ available: true });
+    const onLocalError = vi.fn();
+    let signal: AbortSignal | undefined;
+    const controller = new SessionController({
+      dispatch: vi.fn(),
+      engineFactory: () => engine,
+      microphoneFactory: (options) => {
+        signal = options.signal;
+        throw new Error("microphone construction failed");
+      },
+      onLocalError,
+    });
+
+    await expect(controller.start(["en-US"])).rejects.toThrow("microphone construction failed");
+    expect(signal?.aborted).toBe(true);
+    expect(onLocalError).toHaveBeenCalledWith("microphone construction failed");
+  });
+
   it("settles and disposes a never-settling private inspection when disposed", async () => {
     const engine = new PendingInspectionEngine();
     let rejectInspection: (error: Error) => void = () => undefined;

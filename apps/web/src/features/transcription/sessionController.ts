@@ -171,10 +171,16 @@ export class SessionController {
     let microphoneClaimed = false;
     const pendingFrames: PcmFrame[] = [];
     let deliverFrame: (frame: PcmFrame) => void = (frame) => pendingFrames.push(frame);
-    const startingMicrophone = Promise.resolve(this.microphoneFactory({
-      signal: abortController.signal,
-      onFrame: (frame) => deliverFrame(frame),
-    }));
+    const startingMicrophone = new Promise<MicrophoneCapture>((resolve, reject) => {
+      try {
+        resolve(this.microphoneFactory({
+          signal: abortController.signal,
+          onFrame: (frame) => deliverFrame(frame),
+        }));
+      } catch (error) {
+        reject(error);
+      }
+    });
     // Every operation is observed through both resolve and reject handlers, per
     // this file's established idiom, so a stale or failed capture never becomes
     // an unhandled rejection while other work is still in flight.
