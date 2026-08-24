@@ -19,5 +19,6 @@ Default endpoint is `ws://127.0.0.1:8787`. The web app may override that with
 5. `stop()` / `cancel()` send the matching control message and wait for the
    session to end. Closing the socket does not unload the server model.
 
-When the transcription server is not running, use **Offline local** in the UI
-instead of this engine.
+The shipping web UI always uses this engine. If the transcription server is
+not listening on loopback, `prepare()` fails with `local Whisper server is
+unavailable`.

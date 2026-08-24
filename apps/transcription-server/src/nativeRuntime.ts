@@ -3,6 +3,7 @@ import type { PcmFrame, SessionRequest } from "@voice/transcription-contracts";
 import { posix } from "node:path";
 
 import type { DecodeResult, StreamingRuntime, StreamingRuntimeSession, VadUpdate } from "./runtime.js";
+import { fallbackWhisperLanguages, mapDetectedLanguage, pinnedWhisperLanguage } from "./languageMap.js";
 import { createVadGate, VAD_DEFAULTS } from "./vadGate.js";
 
 const DEFAULT_DECODE_TIMEOUT_MS = 30_000;
@@ -89,13 +90,30 @@ export function createNativeStreamingRuntime(options: NativeStreamingRuntimeOpti
     await ready();
   }
 
-  async function open(_request: SessionRequest): Promise<StreamingRuntimeSession> {
+  async function open(request: SessionRequest): Promise<StreamingRuntimeSession> {
     await ready();
     if (activeSession) throw new Error("native runtime is busy");
 
     const gate = createVadGate();
     let windowIndex = 0;
     let reportedSpeaking = false;
+    const language = pinnedWhisperLanguage(request.candidateLanguages);
+
+    async function decodeOnce(audio: Int16Array, decodeLanguage: string | undefined): Promise<DecodeResult> {
+      if (!handle) throw new Error("native runtime handle is missing");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const decodePromise = handle.decode(audio, "", decodeLanguage);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("TIMEOUT")), decodeTimeoutMs);
+      });
+      void decodePromise.catch(() => undefined);
+      void timeoutPromise.catch(() => undefined);
+      try {
+        return await Promise.race([decodePromise, timeoutPromise]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    }
 
     const session: StreamingRuntimeSession = {
       push(frame: PcmFrame): VadUpdate {
@@ -118,33 +136,43 @@ export function createNativeStreamingRuntime(options: NativeStreamingRuntimeOpti
           if (decision.type !== "flush") continue;
           if (!reportedSpeaking) update.speechStarted = true;
           reportedSpeaking = false;
-          if (decision.reason === "silence") update.speechEnded = true;
-          if (decision.reason === "max-duration") update.maxDuration = true;
+          if (decision.reason === "silence") {
+            update.speechEnded = true;
+          }
+          if (decision.reason === "max-duration") {
+            update.maxDuration = true;
+          }
         }
 
         return update;
       },
 
-      async decode(_kind: "provisional" | "final", audio: Int16Array, prompt: string): Promise<DecodeResult> {
-        if (!handle) throw new Error("native runtime handle is missing");
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const decodePromise = handle.decode(audio, prompt);
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("TIMEOUT")), decodeTimeoutMs);
-        });
-        // Both legs can lose the race; attach swallows so the loser is not unhandled.
-        void decodePromise.catch(() => undefined);
-        void timeoutPromise.catch(() => undefined);
+      async decode(_kind: "provisional" | "final", audio: Int16Array, _prompt: string): Promise<DecodeResult> {
         try {
-          return await Promise.race([decodePromise, timeoutPromise]);
-        } catch (error) {
-          if (error instanceof Error && /timeout/i.test(error.message)) {
-            await recycle();
-            throw error;
+          let result = await decodeOnce(audio, language);
+          if (!language) {
+            const mapped = mapDetectedLanguage(result.language, result.languageProbability, request.candidateLanguages);
+            if (mapped.tag === "und") {
+              const fallback = fallbackWhisperLanguages(result.language, request.candidateLanguages)[0];
+              if (fallback) {
+                try {
+                  const retried = await decodeOnce(audio, fallback);
+                  result = { ...retried, language: fallback, languageProbability: 1 };
+                } catch {
+                  // Keep the auto-detect result. A forced-language retry that
+                  // fails or hangs the native context must not drop the caption
+                  // or pin later utterances to that language.
+                }
+              }
+            }
           }
+          return result;
+        } catch (error) {
+          // Timeout and whisper_full failures both leave ggml state unusable.
+          // Reload once so the next utterance can decode instead of failing
+          // silently for the rest of the session.
+          await recycle();
           throw error;
-        } finally {
-          if (timer !== undefined) clearTimeout(timer);
         }
       },
 

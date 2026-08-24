@@ -14,7 +14,7 @@ function parsePort(value, fallback, name) {
 function parseConfig() {
     const host = process.env.VOICE_HOST ?? "127.0.0.1";
     const port = parsePort(process.env.VOICE_PORT, 8787, "VOICE_PORT");
-    const allowedOrigins = (process.env.VOICE_ALLOWED_ORIGINS ?? "http://localhost:5173")
+    const allowedOrigins = (process.env.VOICE_ALLOWED_ORIGINS ?? "http://localhost:5173,http://127.0.0.1:5173")
         .split(",")
         .map((origin) => origin.trim())
         .filter((origin) => origin.length > 0);
@@ -26,7 +26,7 @@ function parseConfig() {
     const modelPath = process.env.VOICE_MODEL_PATH;
     const vadModelPath = process.env.VOICE_VAD_MODEL_PATH;
     const useGpu = process.env.VOICE_USE_GPU === "1";
-    const threads = parsePort(process.env.VOICE_THREADS, 4, "VOICE_THREADS");
+    const threads = parsePort(process.env.VOICE_THREADS, 8, "VOICE_THREADS");
     if (!fake) {
         if (!modelPath || !vadModelPath) {
             throw new Error("VOICE_MODEL_PATH and VOICE_VAD_MODEL_PATH are required");

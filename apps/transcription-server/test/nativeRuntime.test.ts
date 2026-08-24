@@ -199,6 +199,64 @@ describe("createNativeStreamingRuntime", () => {
     await session.close();
   });
 
+  it("pins whisper language when the session has one candidate", async () => {
+    const handle = fakeHandle();
+    const runtime = createRuntime(() => handle);
+    await runtime.ready();
+    const session = await runtime.open({ ...request, candidateLanguages: ["en-US"] });
+    await session.decode("provisional", new Int16Array([1]), "");
+    expect(handle.decode).toHaveBeenCalledWith(expect.any(Int16Array), "", "en");
+    await session.close();
+  });
+
+  it("re-decodes as Vietnamese when auto-detect returns Chinese and Chinese is not selected", async () => {
+    const handle = fakeHandle({
+      decode: vi.fn(async (_audio, _prompt, lang) => {
+        if (lang === "vi") {
+          return { ...DECODE_RESULT, text: "Xin chào", language: "vi" };
+        }
+        return { ...DECODE_RESULT, text: "新郎", language: "zh" };
+      }),
+    });
+    const runtime = createRuntime(() => handle);
+    await runtime.ready();
+    const session = await runtime.open(request);
+    const result = await session.decode("provisional", new Int16Array([1]), "");
+    expect(handle.decode).toHaveBeenNthCalledWith(1, expect.any(Int16Array), "", undefined);
+    expect(handle.decode).toHaveBeenNthCalledWith(2, expect.any(Int16Array), "", "vi");
+    expect(result).toMatchObject({ text: "Xin chào", language: "vi" });
+    await session.close();
+  });
+
+  it("does not pin later decodes to the first detected language", async () => {
+    const handle = fakeHandle({
+      decode: vi.fn(async () => ({ ...DECODE_RESULT, text: "Xin chào", language: "vi" })),
+    });
+    const runtime = createRuntime(() => handle);
+    await runtime.ready();
+    const session = await runtime.open(request);
+    await session.decode("provisional", new Int16Array([1]), "");
+    await session.decode("provisional", new Int16Array([2]), "");
+    expect(handle.decode).toHaveBeenNthCalledWith(1, expect.any(Int16Array), "", undefined);
+    expect(handle.decode).toHaveBeenNthCalledWith(2, expect.any(Int16Array), "", undefined);
+    await session.close();
+  });
+
+  it("keeps the auto-detect result when the Vietnamese retry fails", async () => {
+    const handle = fakeHandle({
+      decode: vi.fn(async (_audio, _prompt, lang) => {
+        if (lang === "vi") throw new Error("whisper_full failed");
+        return { ...DECODE_RESULT, text: "新郎", language: "zh" };
+      }),
+    });
+    const runtime = createRuntime(() => handle);
+    await runtime.ready();
+    const session = await runtime.open(request);
+    const result = await session.decode("provisional", new Int16Array([1]), "");
+    expect(result).toMatchObject({ text: "新郎", language: "zh" });
+    await session.close();
+  });
+
   it("decode forwards to the handle and recycles on timeout with TIMEOUT", async () => {
     vi.useFakeTimers();
     const handles: NativeRuntimeHandle[] = [];
@@ -217,7 +275,7 @@ describe("createNativeStreamingRuntime", () => {
     const hanging = session.decode("final", samples, "prompt");
     const timedOut = expect(hanging).rejects.toThrow(/TIMEOUT/i);
     await Promise.resolve();
-    expect(handles[0]!.decode).toHaveBeenCalledWith(samples, "prompt");
+    expect(handles[0]!.decode).toHaveBeenCalledWith(samples, "", undefined);
 
     await vi.advanceTimersByTimeAsync(30_000);
     await timedOut;
@@ -231,6 +289,31 @@ describe("createNativeStreamingRuntime", () => {
     await session.close();
     expect(handles[1]!.reset).toHaveBeenCalledTimes(1);
     expect(handles[1]!.close).not.toHaveBeenCalled();
+  });
+
+  it("recycles the native handle after whisper_full fails so a later decode can run", async () => {
+    const handles: NativeRuntimeHandle[] = [];
+    const createHandle = vi.fn(() => {
+      const handle = fakeHandle({
+        decode: vi.fn(async () => {
+          if (handles.length === 1) throw new Error("whisper_full failed");
+          return DECODE_RESULT;
+        }),
+      });
+      handles.push(handle);
+      return handle;
+    });
+    const runtime = createRuntime(createHandle);
+    await runtime.ready();
+    const session = await runtime.open(request);
+
+    await expect(session.decode("final", new Int16Array([1]), "")).rejects.toThrow(/whisper_full failed/);
+    expect(handles[0]!.close).toHaveBeenCalledTimes(1);
+    expect(createHandle).toHaveBeenCalledTimes(2);
+    expect(handles[1]!.warmup).toHaveBeenCalledTimes(1);
+
+    await expect(session.decode("final", new Int16Array([2]), "")).resolves.toEqual(DECODE_RESULT);
+    await session.close();
   });
 
   it("session close resets a healthy handle instead of unloading it", async () => {

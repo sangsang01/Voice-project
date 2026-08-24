@@ -5,15 +5,15 @@ this repository.
 
 ## What this is
 
-A multilingual transcription app with two modes:
+A multilingual transcription app. The shipping UI is **Live (this PC)** only:
 
 ```text
 Live (this PC): microphone -> ws://127.0.0.1:8787 -> warm native Whisper -> provisional/final revisions -> UI
-Offline local: microphone -> browser Worker -> WASM tiny Whisper -> final-only text
 ```
 
-It supports Vietnamese (`vi-VN`), English (`en-US`), Spanish (`es-ES`), and
-Chinese (`zh-CN`) and keeps speech in its original language.
+It supports Vietnamese (`vi-VN`), English (`en-US`), and Spanish (`es-ES`) and
+keeps speech in its original language. A browser WASM `tiny` engine still lives
+in `packages/local-whisper-engine` but is not offered in the UI.
 
 Live mode is a two-process loopback path: the browser sends 16 kHz PCM to
 `apps/transcription-server` on `ws://127.0.0.1:8787` (subprotocol
@@ -21,9 +21,9 @@ Live mode is a two-process loopback path: the browser sends 16 kHz PCM to
 provisional then final revisions. The server binds loopback only, does not
 persist transcripts, and rejects `.en` models.
 
-Offline local is the existing WASM path: whisper.cpp v1.9.2 in a Web Worker,
-Silero VAD v6.2.0 gating utterances, final-only text. Use it when the
-transcription server is not running. Do not imply GPU acceleration for WASM.
+The WASM path in `packages/local-whisper-engine` is still in the repo
+(whisper.cpp v1.9.2 in a Web Worker, Silero VAD, final-only text). It is not
+wired in the shipping UI. Do not imply GPU acceleration for WASM.
 
 This is an npm workspaces monorepo (`apps/*`, `packages/*`). One root
 `npm install` covers every workspace and fetches **browser** WASM tiny into
@@ -109,7 +109,7 @@ fetch → set `VOICE_MODEL_PATH` / `VOICE_VAD_MODEL_PATH` → restart the server
 with `--model base`; do not silently change the code default.
 
 Client Origin env is `VOICE_ORIGIN`; server is `VOICE_ALLOWED_ORIGINS`.
-Defaults both `http://localhost:5173`. `VOICE_THREADS` defaults to 4.
+Defaults both `http://localhost:5173`. `VOICE_THREADS` defaults to 8.
 `VOICE_HOST` default `127.0.0.1`, `VOICE_PORT` default `8787`.
 
 ## Architecture
@@ -164,18 +164,17 @@ adapter.
 ### Live path (two processes)
 
 1. `apps/web` captures 16 kHz mono audio in 20 ms / 320-sample PCM frames.
-2. With **Live (this PC)** selected, `RemoteWhisperEngine` opens
-   `ws://127.0.0.1:8787` using subprotocol `voice-transcription.v1` and sends
-   656-byte PCM messages. One session per socket. Credit comes from
-   `audio.ack` (`throughSequence` is cumulative).
+2. `RemoteWhisperEngine` opens `ws://127.0.0.1:8787` using subprotocol
+   `voice-transcription.v1` and sends 656-byte PCM messages. One session per
+   socket. Credit comes from `audio.ack` (`throughSequence` is cumulative).
 3. `apps/transcription-server` admits the Origin
    (`VOICE_ALLOWED_ORIGINS`), keeps one warm native handle, runs Silero VAD,
    and schedules rolling provisional decodes plus a final after silence.
 4. `packages/native-whisper-addon` owns the whisper.cpp / Silero contexts.
    Process start is the warm load. A timeout closes the handle and reloads
    once; healthy `stop`/`cancel` call `reset()`, not unload.
-5. If the server is down, the UI **Offline local** path uses
-   `LocalWhisperEngine` instead.
+5. If the server is down, the UI reports `local Whisper server is unavailable`.
+   `LocalWhisperEngine` remains in the repo as the unused-in-UI WASM path.
 
 ### Local engine flow
 
@@ -201,9 +200,8 @@ TypeScript so they can be unit-tested without a WASM toolchain.
   drive the session state machine and transcript state.
 - `src/features/transcription/audio/` contains microphone capture and the
   AudioWorklet pipeline that creates contract-shaped PCM frames.
-- `src/features/transcription/TranscriptionAdapter.tsx` constructs either the
-  remote engine (Live) or the local WASM engine (Offline local) and bridges
-  events into React UI state.
+- `src/features/transcription/TranscriptionAdapter.tsx` constructs the remote
+  engine (Live) and bridges events into React UI state.
 - `vite.config.ts` supplies COOP/COEP headers for development and preview.
   Production hosting must send the same headers.
 

@@ -1,4 +1,5 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type {
   EngineEvent,
   EngineEventListener,
@@ -128,40 +129,59 @@ function renderAdapter(options: { engine?: ControlledEngine; failMicrophone?: bo
   return { engine, microphone, emitFrame: (nextFrame: PcmFrame) => onFrame?.(nextFrame) };
 }
 
-async function startOfflineLocal() {
-  fireEvent.click(screen.getByRole("button", { name: "Offline local" }));
-  await waitFor(() => expect(screen.getByRole("button", { name: "Start" })).toBeEnabled());
-  fireEvent.click(screen.getByRole("button", { name: "Start" }));
-}
-
 describe("TranscriptionAdapter", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
   });
 
-  it("validates selection to one through four unique languages", () => {
+  it("offers English, Vietnamese, and Spanish in a language dropdown", () => {
     renderAdapter();
 
-    fireEvent.click(screen.getByRole("button", { name: "Start" }));
-    expect(screen.getByRole("alert")).toHaveTextContent("Select between 1 and 4 unique languages");
-
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
-    fireEvent.click(screen.getByRole("button", { name: "Vietnamese" }));
-    fireEvent.click(screen.getByRole("button", { name: "Spanish" }));
-    fireEvent.click(screen.getByRole("button", { name: "Chinese" }));
-    fireEvent.click(screen.getByRole("button", { name: "Start" }));
-
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    const language = screen.getByRole("combobox", { name: "Language" });
+    expect(language).toHaveValue("en-US");
+    expect(within(language).getByRole("option", { name: "English" })).toBeInTheDocument();
+    expect(within(language).getByRole("option", { name: "Vietnamese" })).toBeInTheDocument();
+    expect(within(language).getByRole("option", { name: "Spanish" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Chinese" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "English (US)" })).not.toBeInTheDocument();
   });
 
-  it("opens the local engine before requesting microphone permission and drains on stop", async () => {
+  it("starts with the selected language as the only candidate", async () => {
+    const { engine } = renderAdapter();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Language" }), { target: { value: "vi-VN" } });
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+
+    await waitFor(() => expect(engine.open).toHaveBeenCalledTimes(1));
+    expect(engine.open.mock.calls[0]?.[0].candidateLanguages).toEqual(["vi-VN"]);
+  });
+
+  it("does not offer Live or Offline mode controls and always uses the remote engine", async () => {
+    defaultLocalEngine.created = 0;
+    defaultRemoteEngine.created = 0;
+    defaultRemoteEngine.endpoints = [];
+    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "ws://127.0.0.1:8787");
+    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
+
+    expect(screen.queryByRole("button", { name: "Live (this PC)" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Offline local" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Start" }));
+    await waitFor(() => expect(defaultRemoteEngine.created).toBe(1));
+    expect(defaultLocalEngine.created).toBe(0);
+    expect(defaultRemoteEngine.endpoints).toEqual(["ws://127.0.0.1:8787"]);
+  });
+
+  it("requests microphone permission alongside model preparation and drains on stop", async () => {
     const { engine, microphone } = renderAdapter();
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
 
     await waitFor(() => expect(engine.open).toHaveBeenCalledTimes(1));
     expect(microphone).toHaveBeenCalledTimes(1);
-    expect(engine.open.mock.invocationCallOrder[0]).toBeLessThan(microphone.mock.invocationCallOrder[0]);
+    // Capture starts in parallel with (not after) model preparation, so its real
+    // audio graph is already warm by the time the session opens instead of racing
+    // the model-loading worker's heavy WASM computation.
+    expect(microphone.mock.invocationCallOrder[0]).toBeLessThan(engine.open.mock.invocationCallOrder[0]);
 
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
     await waitFor(() => expect(engine.session.stop).toHaveBeenCalledTimes(1));
@@ -173,7 +193,6 @@ describe("TranscriptionAdapter", () => {
     const microphone = vi.fn(async () => ({ stop: vi.fn(async () => undefined) }));
     render(<TranscriptionAdapter engineFactory={factory} microphoneFactory={microphone} initialLanguages={[]} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(engine.open).toHaveBeenCalledTimes(1));
 
@@ -195,81 +214,11 @@ describe("TranscriptionAdapter", () => {
     engine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
     renderAdapter({ engine });
 
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
 
     expect(await screen.findByText("Preparing local model…")).toBeVisible();
     expect(screen.getByRole("status")).toHaveTextContent("Preparing");
     expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
-  });
-
-  it("renders progress reported by the default local engine", async () => {
-    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
-    defaultLocalEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
-    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
-
-    await startOfflineLocal();
-    expect(await screen.findByRole("status")).toHaveTextContent("Preparing");
-    await waitFor(() => expect(defaultLocalEngine.onProgress).toEqual(expect.any(Function)));
-    act(() => defaultLocalEngine.onProgress?.(0.42));
-
-    expect(await screen.findByText("Preparing local model 42%")).toBeVisible();
-    const progress = screen.getByRole("progressbar", { name: "Local model preparation" });
-    expect(progress).toHaveAttribute("value", "0.42");
-    expect(progress.closest(".transcript")).toBeNull();
-  });
-
-  it("keeps the latest model load visible when an older run settles", async () => {
-    defaultLocalEngine.created = 0;
-    defaultLocalEngine.inspect.mockReset();
-    defaultLocalEngine.prepare.mockReset();
-    defaultLocalEngine.open.mockReset();
-    defaultLocalEngine.dispose.mockReset();
-    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
-    let resolveFirstPrepare: () => void = () => undefined;
-    defaultLocalEngine.prepare
-      .mockImplementationOnce(() => new Promise<undefined>((resolve) => { resolveFirstPrepare = () => resolve(undefined); }))
-      .mockImplementationOnce(() => new Promise<never>(() => undefined));
-    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
-
-    await startOfflineLocal();
-    await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(1));
-    fireEvent.click(screen.getByRole("button", { name: "Clear & Restart" }));
-    await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(2));
-    expect(defaultLocalEngine.created).toBe(2);
-    act(() => defaultLocalEngine.onProgress?.(0.42));
-    expect(await screen.findByText("Preparing local model 42%")).toBeVisible();
-
-    resolveFirstPrepare();
-    await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent("Preparing");
-      expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
-      expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
-      expect(screen.getByText("Preparing local model 42%")).toBeVisible();
-    });
-  });
-
-  it("ignores progress emitted by a superseded local engine", async () => {
-    defaultLocalEngine.created = 0;
-    defaultLocalEngine.onProgressCallbacks = [];
-    defaultLocalEngine.inspect.mockReset();
-    defaultLocalEngine.prepare.mockReset();
-    defaultLocalEngine.open.mockReset();
-    defaultLocalEngine.dispose.mockReset();
-    defaultLocalEngine.inspect.mockResolvedValue({ available: true });
-    defaultLocalEngine.prepare.mockImplementation(() => new Promise<never>(() => undefined));
-    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
-
-    await startOfflineLocal();
-    await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(1));
-    fireEvent.click(screen.getByRole("button", { name: "Clear & Restart" }));
-    await waitFor(() => expect(defaultLocalEngine.prepare).toHaveBeenCalledTimes(2));
-    expect(defaultLocalEngine.onProgressCallbacks).toHaveLength(2);
-
-    act(() => defaultLocalEngine.onProgressCallbacks[1]?.(0.42));
-    expect(await screen.findByText("Preparing local model 42%")).toBeVisible();
-    act(() => defaultLocalEngine.onProgressCallbacks[0]?.(0.9));
-    expect(screen.getByText("Preparing local model 42%")).toBeVisible();
   });
 
   it("surfaces unsupported local capabilities without preparing or opening an engine", async () => {
@@ -282,7 +231,6 @@ describe("TranscriptionAdapter", () => {
     engine.open.mockImplementation(async () => { throw new Error("open must not run"); });
     renderAdapter({ engine });
 
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("cross-origin isolation");
@@ -298,7 +246,6 @@ describe("TranscriptionAdapter", () => {
     engine.prepare.mockImplementation(() => new Promise<undefined>((resolve) => { resolvePrepare = () => resolve(undefined); }));
     const { microphone } = renderAdapter({ engine });
 
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     expect(await screen.findByText("Preparing local model…")).toBeInTheDocument();
 
@@ -309,13 +256,17 @@ describe("TranscriptionAdapter", () => {
     resolvePrepare();
     await waitFor(() => expect(engine.dispose).toHaveBeenCalled());
     expect(engine.open).not.toHaveBeenCalled();
-    expect(microphone).not.toHaveBeenCalled();
+    // Capture now starts eagerly, in parallel with model preparation, rather than
+    // waiting for it; stopping while still preparing must tear that capture down
+    // instead of leaving it live and unused.
+    expect(microphone).toHaveBeenCalledTimes(1);
+    const capture = await microphone.mock.results[0]!.value;
+    await waitFor(() => expect(capture.stop).toHaveBeenCalledTimes(1));
     expect(screen.getByRole("status")).toHaveTextContent("Standby");
   });
 
   it("renders provisional and final segments with language badges and model progress", async () => {
     const { engine } = renderAdapter();
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(engine.open).toHaveBeenCalled());
 
@@ -333,15 +284,28 @@ describe("TranscriptionAdapter", () => {
       },
     });
 
-    expect(await within(document.querySelector(".transcript") as HTMLElement).findByText("Hello world")).toBeVisible();
-    expect(screen.getByText("en-US")).toBeInTheDocument();
+    const transcript = document.querySelector(".transcript") as HTMLElement;
+    expect(await within(transcript).findByText("Hello world")).toBeVisible();
+    expect(within(transcript).getByText("English")).toBeVisible();
     expect(screen.getByRole("status")).toHaveTextContent("Listening");
+
+    engine.session.emit({
+      type: "segment.upsert", sequence: 4, segment: {
+        id: "s2", ordinal: 2, revision: 1, startMs: 400, endMs: 700, text: "Xin chào", language: { tag: "vi-VN" }, isFinal: true,
+      },
+    });
+    engine.session.emit({
+      type: "segment.upsert", sequence: 5, segment: {
+        id: "s3", ordinal: 3, revision: 1, startMs: 700, endMs: 900, text: "?", language: { tag: "und" }, isFinal: true,
+      },
+    });
+    expect(await within(transcript).findByText("Vietnamese")).toBeVisible();
+    expect(within(transcript).queryByText("und")).not.toBeInTheDocument();
   });
 
   it("warns on backpressure and ignores stale events after clear and restart", async () => {
     const engine = new ControlledEngine();
     const { emitFrame } = renderAdapter({ engine });
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(engine.open).toHaveBeenCalled());
     engine.session.rejectNextFrame = true;
@@ -360,7 +324,6 @@ describe("TranscriptionAdapter", () => {
 
   it("shows local microphone failures", async () => {
     renderAdapter({ failMicrophone: true });
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Microphone permission was denied");
     expect(screen.getByRole("status")).toHaveTextContent("Standby");
@@ -380,40 +343,24 @@ describe("TranscriptionAdapter", () => {
     await waitFor(() => expect(engine.dispose).toHaveBeenCalledTimes(1));
   });
 
-  it("creates the remote engine by default when a live endpoint is configured", async () => {
-    defaultLocalEngine.created = 0;
-    defaultRemoteEngine.created = 0;
-    defaultRemoteEngine.endpoints = [];
-    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "ws://127.0.0.1:8787");
-    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
-
-    expect(screen.getByRole("button", { name: "Live (this PC)" })).toBeInTheDocument();
-    expect(document.querySelector(".engine-mode")).toHaveTextContent("Live (this PC)");
-
-    fireEvent.click(screen.getByRole("button", { name: "Start" }));
-    await waitFor(() => expect(defaultRemoteEngine.created).toBe(1));
-    expect(defaultLocalEngine.created).toBe(0);
-    expect(defaultRemoteEngine.endpoints).toEqual(["ws://127.0.0.1:8787"]);
-  });
-
-  it("creates the local engine after switching from Live to Offline local", async () => {
-    defaultLocalEngine.created = 0;
-    defaultRemoteEngine.created = 0;
-    vi.stubEnv("VITE_TRANSCRIPTION_WS_URL", "ws://127.0.0.1:8787");
-    render(<TranscriptionAdapter initialLanguages={["en-US"]} />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Offline local" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Start" })).toBeEnabled());
-    expect(document.querySelector(".engine-mode")).toHaveTextContent("Offline local");
+  it("starts a live session after React Strict Mode remounts the adapter", async () => {
+    const engine = new ControlledEngine();
+    const factory = vi.fn(() => engine);
+    const microphone = vi.fn(async () => ({ stop: vi.fn(async () => undefined) }));
+    render(
+      <StrictMode>
+        <TranscriptionAdapter engineFactory={factory} microphoneFactory={microphone} initialLanguages={["en-US"]} />
+      </StrictMode>,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
-    await waitFor(() => expect(defaultLocalEngine.created).toBe(1));
-    expect(defaultRemoteEngine.created).toBe(0);
+    await waitFor(() => expect(engine.open).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("status")).toHaveTextContent("Listening");
+    expect(screen.getByText("Hearing you… captions will appear here.")).toBeInTheDocument();
   });
 
   it("replaces a provisional caption in place and keeps finalized text in a polite live region", async () => {
     const { engine } = renderAdapter();
-    fireEvent.click(screen.getByRole("button", { name: "English (US)" }));
     fireEvent.click(screen.getByRole("button", { name: "Start" }));
     await waitFor(() => expect(engine.open).toHaveBeenCalled());
 
@@ -431,8 +378,9 @@ describe("TranscriptionAdapter", () => {
       return paragraph as HTMLElement;
     });
     expect(provisional).toHaveAttribute("data-final", "false");
-    expect(provisional).toHaveTextContent(/Hello/);
-    expect(provisional).toHaveTextContent(/Updating/);
+    expect(provisional).toHaveTextContent("Hello");
+    expect(provisional.querySelector(".transcript-updating")).toBeNull();
+    expect(provisional).not.toHaveTextContent("…");
     const liveRegion = document.querySelector(".visually-hidden");
     expect(liveRegion).toHaveAttribute("aria-live", "polite");
     expect(liveRegion).not.toHaveTextContent("Hello");

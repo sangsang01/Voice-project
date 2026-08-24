@@ -200,7 +200,7 @@ class RemoteSession implements TranscriptionSession {
   }
 
   private sendControl(type: "session.stop" | "session.cancel"): void {
-    if (this.controlSent) return;
+    if (this.controlSent && type !== "session.cancel") return;
     this.controlSent = true;
     if (this.socket.readyState !== SOCKET_OPEN) return;
     this.socket.send(JSON.stringify({ type, sessionId: this.request.sessionId }));

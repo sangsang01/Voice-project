@@ -29,7 +29,13 @@ export function createTranscriptionGateway(options) {
                 return protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false;
             },
             verifyClient(info) {
-                return control.admitting && options.allowedOrigins.includes(info.origin) && hasRequiredSubprotocol(info.req);
+                const allowed = options.allowedOrigins.includes(info.origin);
+                const subprotocol = hasRequiredSubprotocol(info.req);
+                const ok = control.admitting && allowed && subprotocol;
+                if (!ok) {
+                    console.warn(`websocket rejected origin=${info.origin || "(empty)"} admitting=${control.admitting} originAllowed=${allowed} subprotocol=${subprotocol}`);
+                }
+                return ok;
             },
         });
         const onListenError = (error) => reject(error);
@@ -141,13 +147,11 @@ function bindConnection(socket, options, pool, capacity, connections) {
             return;
         }
         if (control.type === "session.stop") {
-            await state.scheduler?.stop();
-            await finish(state, false);
+            void endSession(state, "stop");
             return;
         }
         if (control.type === "session.cancel") {
-            await state.scheduler?.cancel();
-            await finish(state, false);
+            void endSession(state, "cancel");
         }
     }
 }
@@ -184,6 +188,7 @@ async function acceptSession(socket, state, options, pool, capacity, request) {
         });
         state.scheduler = scheduler;
         state.started = true;
+        console.error(`session accepted ${request.sessionId} languages=${request.candidateLanguages.join(",")}`);
         sendJson(socket, {
             type: "session.accepted",
             sessionId: request.sessionId,
@@ -209,11 +214,11 @@ async function handleBinary(socket, state, data) {
         fail(socket, state, "INVALID_AUDIO", "malformed PCM frame");
         return;
     }
+    if (state.lastPcmSequence === undefined) {
+        console.log(`audio frames started ${state.sessionId}`);
+    }
     if (state.lastPcmSequence !== undefined && frame.sequence !== state.lastPcmSequence + 1) {
         warn(socket, state, "AUDIO_GAP", `audio sequence jumped from ${state.lastPcmSequence} to ${frame.sequence}`);
-        socket.close(CLOSE_PROTOCOL, "AUDIO_GAP");
-        await finish(state, true).catch(() => undefined);
-        return;
     }
     state.lastPcmSequence = frame.sequence;
     const samples = new Int16Array(frame.samples.length);
@@ -224,6 +229,17 @@ async function handleBinary(socket, state, data) {
         sessionId: state.sessionId,
         throughSequence: frame.sequence,
     });
+}
+async function endSession(state, mode) {
+    try {
+        if (mode === "cancel")
+            await state.scheduler?.cancel();
+        else
+            await state.scheduler?.stop();
+    }
+    finally {
+        await finish(state, false);
+    }
 }
 async function finish(state, cancelIfActive) {
     if (state.cleaned)

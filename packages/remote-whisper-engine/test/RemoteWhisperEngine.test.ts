@@ -90,6 +90,44 @@ describe("RemoteWhisperEngine lifecycle", () => {
     await engine.dispose();
   });
 
+  it("sends session.cancel even after session.stop was already sent", async () => {
+    const sockets: FakeSocket[] = [];
+    const engine = new RemoteWhisperEngine({
+      endpoint: "ws://127.0.0.1:8787",
+      socketFactory: (url) => {
+        const socket = new FakeSocket(url);
+        sockets.push(socket);
+        queueMicrotask(() => socket.open());
+        return socket;
+      },
+    });
+    await engine.prepare(request);
+    const opening = engine.open(request);
+    sockets[0]!.emitJson({
+      type: "session.accepted",
+      sessionId: request.sessionId,
+      model: "small",
+      backend: "cpu",
+    });
+    const session = await opening;
+    void session.stop();
+    await Promise.resolve();
+    expect(sockets[0]!.sentJson()).toContainEqual({ type: "session.stop", sessionId: request.sessionId });
+    void session.cancel();
+    await Promise.resolve();
+    expect(sockets[0]!.sentJson()).toContainEqual({ type: "session.cancel", sessionId: request.sessionId });
+    sockets[0]!.emitJson({
+      type: "engine.event",
+      event: {
+        type: "state",
+        sessionId: request.sessionId,
+        sequence: 0,
+        state: "stopped",
+      },
+    });
+    await engine.dispose();
+  });
+
   it("emits one fatal UNAVAILABLE and stopped when the socket closes", async () => {
     const sockets: FakeSocket[] = [];
     const engine = new RemoteWhisperEngine({

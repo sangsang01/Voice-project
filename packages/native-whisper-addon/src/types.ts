@@ -8,7 +8,7 @@ export interface NativeDecodeResult {
 
 export interface NativeRuntimeHandle {
   pushVad(samples: Int16Array): Float32Array;
-  decode(samples: Int16Array, prompt: string): Promise<NativeDecodeResult>;
+  decode(samples: Int16Array, prompt: string, language?: string): Promise<NativeDecodeResult>;
   warmup(): Promise<void>;
   reset(): void;
   close(): void;

@@ -1,281 +1,253 @@
-# Localhost multilingual transcription
+# Earth Assistant
 
-This app transcribes live microphone audio in a recent desktop Chromium browser.
-It supports Vietnamese (`vi-VN`), English (`en-US`), Spanish (`es-ES`), and
-Chinese (`zh-CN`) and keeps speech in its original language.
+I started this project because my parents are immigrants to the United States,
+and they sometimes have difficulty communicating with others in English. I
+wanted to explore whether I could build a mobile application that provides
+real-time transcription during conversations and makes communication easier
+for people like them. This project is the first step toward that goal, focusing
+on the core speech-to-text infrastructure that a future mobile application
+could build on.
 
-There are two modes:
+Localhost live captions for **English**, **Vietnamese**, and **Spanish**. Speech
+stays in its original language. Audio never leaves this computer.
+
+This is a **two-process desktop demo**, not a public website. There is no
+deployed URL a recruiter can click. The intended demo is: clone the repo, start
+the local Whisper server, open the UI, and speak.
 
 ```text
-Live (this PC): microphone -> ws://127.0.0.1:8787 -> warm native Whisper -> provisional/final revisions -> UI
-Offline local: microphone -> browser Worker -> WASM tiny Whisper -> final-only text
+Microphone → browser (16 kHz PCM) → ws://127.0.0.1:8787 → native whisper.cpp → captions
 ```
 
-**Live (this PC)** is the default. Audio stays on this machine: the browser
-sends PCM to a loopback WebSocket, and a Node process runs whisper.cpp through
-a native addon. The server does not persist transcripts and does not bind off
-loopback.
+## Recommended environment
 
-**Offline local** is the browser-only fallback. whisper.cpp v1.9.2 compiled to
-WebAssembly runs in a Web Worker, with Silero VAD v6.2.0 gating utterances.
-Use it when the transcription server is not running. WASM inference is
-CPU-only; there is no GPU acceleration on that path.
+The setup that works best for this project — and the one to tell a recruiter to
+use — is:
 
-Browser WASM `tiny` weights are downloaded during `npm install` into
-`apps/web/public/models/` and served from the app origin. Server models are a
-separate fetch into `apps/transcription-server/models/`. A transcription
-session does not fetch models from a third-party host.
+| Piece | Use this |
+| --- | --- |
+| OS | Windows 11 (or current macOS), **desktop**, not a phone |
+| Runtime | **Node.js 22** (20.19+ or 24+ also work) and npm |
+| Editor | **Cursor** (or VS Code) with two terminals |
+| Browser | **Cursor Simple Browser** at `http://127.0.0.1:5173` |
+| Alternate browser | Current **Chrome** or **Edge**, microphone allowed |
+| Model | whisper.cpp **`small`** on **CPU** (default) |
+| Network | None required after the first model download |
 
-Ordinary `npm install` does **not** compile the native addon.
+**Why Cursor’s browser:** the UI is a Chromium page that needs microphone
+access, Vite’s cross-origin-isolation headers (`SharedArrayBuffer`), and a
+loopback Origin the transcription server allows. Opening
+`http://127.0.0.1:5173` in Cursor’s Simple Browser matches that path and is the
+environment used while developing this app. Chrome and Edge work the same way
+if you allow the mic. Firefox, Safari, and mobile are a poor first demo.
+
+You need **two processes**. The web UI alone prints `local Whisper server is
+unavailable`.
+
+Do **not** use `VOICE_FAKE_RUNTIME=1` for a recruiter demo. That skips real
+Whisper.
 
 ## Architecture
 
-```text
-apps/web/
-  React/Vite UI, microphone capture, 16 kHz PCM framing, and session state
-  Live (this PC) uses remote-whisper-engine; Offline local uses the WASM worker
-packages/transcription-contracts/
-  Shared TypeScript engine/session contracts and validators
-packages/streaming-protocol/
-  656-byte PCM codec, JSON control/event types, loopback URL rule
-packages/remote-whisper-engine/
-  Browser TranscriptionEngine over ws://127.0.0.1 (subprotocol voice-transcription.v1)
-apps/transcription-server/
-  Loopback WebSocket gateway, VAD, rolling decode, one warm native handle
-packages/native-whisper-addon/
-  Node-API whisper.cpp + Silero runtime (explicit build:native, not npm install)
-packages/local-whisper-engine/
-  Worker controller, Silero VAD gate, language mapping, and C++/WASM bridge
-  wasm/
-    Committed whisper.cpp bridge build output used by the browser
-scripts/fetch-models.mjs
-  Install-time, checksum-verified browser model download into apps/web/public/models/
-vendor/whisper.cpp/
-  Git submodule pinned to whisper.cpp v1.9.2
+```mermaid
+flowchart LR
+  mic[Microphone]
+  ui["apps/web<br/>React + Vite + AudioWorklet"]
+  remote["remote-whisper-engine<br/>ws://127.0.0.1:8787"]
+  gw["transcription-server<br/>loopback gateway"]
+  vad[Silero VAD]
+  addon["native-whisper-addon<br/>Node-API"]
+  whisper["whisper.cpp small<br/>CPU, warm-loaded"]
+  ui2[Live captions]
+
+  mic --> ui --> remote --> gw
+  gw --> vad
+  gw --> addon --> whisper
+  whisper --> addon --> gw --> remote --> ui2
 ```
 
-The microphone produces 20 ms frames of 16 kHz mono PCM (320 samples,
-little-endian). Live mode ships those frames as 656-byte WebSocket messages.
-The native process runs Silero VAD, emits provisional revisions while speech
-is open, and upserts a final after trailing silence. Offline local groups the
-same PCM into Silero windows in the Worker and emits final-only segments.
+What each part does:
 
-## Prerequisites
+| Path | Role |
+| --- | --- |
+| `apps/web` | UI, microphone capture, 20 ms / 16 kHz PCM frames |
+| `packages/remote-whisper-engine` | Browser client for the loopback WebSocket |
+| `apps/transcription-server` | Origin check, VAD, rolling decode, one warm native handle |
+| `packages/native-whisper-addon` | whisper.cpp + Silero (compile with `build:native`, not `npm install`) |
+| `packages/streaming-protocol` | 656-byte PCM messages, subprotocol `voice-transcription.v1` |
+| `packages/transcription-contracts` | Shared engine/session types |
+| `packages/local-whisper-engine` | Optional in-browser WASM `tiny` engine (not in the shipping UI) |
+| `vendor/whisper.cpp` | Pinned whisper.cpp v1.9.2 submodule |
 
-- Node.js 20.19+, 22.12+, or 24+, and npm.
-- Git with submodule support.
-- A current desktop Chromium browser (Chrome or Edge) with microphone access,
-  WebAssembly SIMD, and cross-origin isolation.
-- For Live (this PC) on Windows: CMake and a C++17 toolchain (Visual Studio
-  Build Tools or LLVM). The checkout path may contain spaces (`Tài liệu`).
-- Docker, or Emscripten 6.0.6 on `PATH`, only when deliberately rebuilding the
-  committed WASM artifacts.
+The server binds **loopback only**. It does not persist transcripts. English-only
+`.en` models are rejected.
 
-## Clone and install
+## User guide
 
-Clone recursively so the whisper.cpp submodule is populated:
+### Install (once)
 
-```bash
-git clone --recurse-submodules <repository-url>
-cd voice-project
-npm install
-```
-
-If the repository was cloned without submodules, initialize them before
-building:
-
-```bash
-git submodule update --init --recursive
-npm install
-```
-
-`npm install` runs the browser model fetcher through `postinstall`. It
-downloads about 32 MB of weights into the gitignored `apps/web/public/models/`
-directory:
-
-| File | Purpose | Approximate size |
-| --- | --- | ---: |
-| `ggml-tiny-q5_1.bin` | Quantized multilingual Whisper model (Offline local) | 31 MB |
-| `ggml-silero-v6.2.0.bin` | Silero VAD v6.2.0 | 885 kB |
-
-Downloads are checked against pinned SHA-256 hashes. Re-run the browser fetch
-with `npm run fetch-models`; already-valid files are reused. That command does
-not download server `small`/`base` weights.
-
-## Live (this PC) on Windows
-
-From the repository root, in PowerShell. Set the model env vars in the same
-terminal that starts the server.
+From the repository root. Clone with submodules. Quote the path if it contains
+spaces (`Tài liệu`).
 
 ```powershell
+git clone --recurse-submodules <repository-url>
+cd Voice-project
 npm install
 npm run build:native --workspace @voice/native-whisper-addon
 npm run fetch-models --workspace @voice/transcription-server -- --model small
+```
+
+`npm install` downloads the browser WASM `tiny` weights (~32 MB) into
+`apps/web/public/models/`. That is **not** the live model.
+
+The live path needs a separate fetch of **`small`** (~466 MB) plus a C++ build
+of the native addon. Native build requires **CMake** and a **C++17** toolchain
+(Visual Studio Build Tools or LLVM on Windows).
+
+If you cloned without submodules:
+
+```powershell
+git submodule update --init --recursive
+```
+
+### Run (every demo)
+
+**Terminal 1 — Whisper server.** Set the env vars in the same window:
+
+```powershell
 $env:VOICE_MODEL_PATH = Join-Path (Get-Location) "apps\transcription-server\models\ggml-small.bin"
 $env:VOICE_VAD_MODEL_PATH = Join-Path (Get-Location) "apps\transcription-server\models\ggml-silero-v6.2.0.bin"
 npm run dev:transcribe
 ```
 
-Wait until the server log prints `listening on ws://127.0.0.1:8787` (that is
-the warm load). In a second terminal:
+Wait until the log prints `listening on ws://127.0.0.1:8787`. That line means
+weights are warm. If you see `EADDRINUSE`, port 8787 is already taken — do not
+start a second server.
+
+**Terminal 2 — UI:**
 
 ```powershell
 npm run dev:web
 ```
 
-Open the printed Vite URL, allow microphone access, select one to four
-candidate languages, leave **Live (this PC)** selected, and click **Start**.
-Vite's development server supplies the required cross-origin-isolation
-headers. The browser Origin defaults to `http://localhost:5173`; the server
-allows that origin via `VOICE_ALLOWED_ORIGINS`.
+**Browser:** open `http://127.0.0.1:5173` in **Cursor Simple Browser** (or
+Chrome / Edge). Allow the microphone. Pick a language. Click **Start**. Speak
+in a quiet room.
 
-The server binds loopback only (`VOICE_HOST` default `127.0.0.1`,
-`VOICE_PORT` default `8787`). It does not persist captions. `.en` model paths
-are rejected. `VOICE_THREADS` defaults to 4. `VOICE_USE_GPU` is `0`/`1` and
-defaults to `0`; set `1` only after compiling the addon with CUDA or Vulkan.
+If Start shows `local Whisper server is unavailable`, Terminal 1 is not
+listening. Leave the UI running and start the server.
 
-A native decode timeout closes the handle (abort callback, join the current
-ggml graph) and reloads weights once. That is recovery only.
+### What you should see
 
-For CI or a demo without the C++ binary:
+| Step | Expected |
+| --- | --- |
+| Page load | Earth Assistant, language picker, Start enabled, status **Standby** |
+| After Start (mic allowed) | Status **Listening**, globe active |
+| While you speak | Captions appear in the transcript box and update in place |
+| After you pause | The line stays as normal text (no “thinking” dots) |
+| Stop | Status **Standby**, last caption remains |
+
+A short English sentence such as “I would like to reserve a room” should
+produce a close caption within about a second after you pause, on CPU `small`.
+Vietnamese and accented speech are weaker on this model — see below.
+
+## Limitations (honest)
+
+This demo favors **privacy and a runnable local loop** over cloud ASR speed or
+accuracy.
+
+- **Speed.** Default live inference is **CPU** `small`. Captions can lag,
+  especially on longer utterances. Whisper is not word-by-word streaming; the
+  server re-decodes a rolling window, then finalizes after about 500 ms of
+  silence.
+- **Accuracy.** `small` is a mid-size model. Quiet rooms work better than
+  noise. Vietnamese, Spanish, and mixed-language speech will miss or distort
+  words more often than a cloud `large` or GPU `medium` setup.
+- **Not a website.** There is no remote decoder. Hosting `apps/web/dist` still
+  requires the loopback server on the same machine.
+- **Languages.** The shipping picker is English, Vietnamese, and Spanish.
+  Whisper still reports one language per utterance, not per word.
+- **VAD.** Silero can split a sentence on a short pause, or wait if the room is
+  noisy.
+- **Not** a medical, legal, or accessibility-critical transcription product.
+
+Latency gates we measure against (on an already-warm server): first partial
+p95 ≤ 1.5 s, refresh p95 ≤ 1.0 s, final after silence p95 ≤ 1.5 s. See
+[`apps/transcription-server/README.md`](apps/transcription-server/README.md).
+
+## How to make it better
+
+The architecture already has hooks for a stronger machine. Do not change the
+code default until you have evidence the new setup still meets the latency
+gates.
+
+**1. Better GPU (speed)**
+
+Default `build:native` is CPU. GPU is a **compile-time** whisper.cpp option
+plus a runtime flag. After a CUDA or Vulkan rebuild of
+`@voice/native-whisper-addon`:
 
 ```powershell
-$env:VOICE_FAKE_RUNTIME = "1"
+$env:VOICE_USE_GPU = "1"
 npm run dev:transcribe
 ```
 
-## Offline local
+Do not set `VOICE_USE_GPU=1` on the CPU binary. Details:
+[`packages/native-whisper-addon/README.md`](packages/native-whisper-addon/README.md)
+and [whisper.cpp CUDA / Vulkan](https://github.com/ggml-org/whisper.cpp#nvidia-gpu-support).
 
-When the transcription server is not running, select **Offline local** in the
-UI and click **Start**. The browser Worker loads same-origin WASM `tiny`
-weights and emits final-only text. No loopback socket is opened.
+**2. Better model (accuracy)**
 
-## Production hosting
+`fetch-server-models` already knows `base`, `small` (default), and `medium`.
+Point the server at the new file and **restart** it:
 
-Build the static web app with:
-
-```bash
-npm run build
+```powershell
+npm run fetch-models --workspace @voice/transcription-server -- --model medium
+$env:VOICE_MODEL_PATH = Join-Path (Get-Location) "apps\transcription-server\models\ggml-medium.bin"
+npm run dev:transcribe
 ```
 
-That script builds workspaces in dependency order (contracts, protocol, local
-engine, remote engine, native TypeScript loader, transcription server, web).
-It still does not compile the native `.node` addon.
+Larger models need more RAM/VRAM and can miss the latency gates on CPU. The
+design intent for a GPU box is in
+[`docs/superpowers/specs/2026-08-11-streaming-whisper-service-design.md`](docs/superpowers/specs/2026-08-11-streaming-whisper-service-design.md).
+The shipping localhost path is
+[`docs/superpowers/specs/2026-08-14-localhost-streaming-captions-design.md`](docs/superpowers/specs/2026-08-14-localhost-streaming-captions-design.md).
 
-Deploy `apps/web/dist/` on a host that sends both headers on the document and
-application assets:
+**3. Threads**
 
-```http
-Cross-Origin-Opener-Policy: same-origin
-Cross-Origin-Embedder-Policy: require-corp
-```
+`VOICE_THREADS` defaults to **8**. On the reference 16-thread CPU, 8 was
+faster than 14. Raise it only after measuring.
 
-The WASM build uses pthread support and therefore requires
-`SharedArrayBuffer`, which Chromium exposes only to a cross-origin-isolated
-page. With `Cross-Origin-Embedder-Policy: require-corp`, any cross-origin assets
-you add must also opt in through CORS or an appropriate
-`Cross-Origin-Resource-Policy` header. Without isolation, Offline local
-reports that local transcription is unavailable. Live (this PC) still needs
-the loopback server on the same machine; this repo does not ship a remote
-hosted decoder.
+## Documentation
+
+| Document | What it is |
+| --- | --- |
+| This README | Recruiter / operator entry point |
+| [`CLAUDE.md`](CLAUDE.md) | Contributor map of commands and packages |
+| [`apps/transcription-server/README.md`](apps/transcription-server/README.md) | Server env vars, fake runtime, benchmarks |
+| [`packages/native-whisper-addon/README.md`](packages/native-whisper-addon/README.md) | Windows native build, CPU vs GPU |
+| [`packages/remote-whisper-engine/README.md`](packages/remote-whisper-engine/README.md) | Browser WebSocket engine |
+| [`packages/streaming-protocol/README.md`](packages/streaming-protocol/README.md) | PCM framing and loopback URL rule |
+| [`packages/local-whisper-engine/README.md`](packages/local-whisper-engine/README.md) | In-browser WASM engine (not in the current UI) |
+| [`docs/superpowers/specs/2026-08-14-localhost-streaming-captions-design.md`](docs/superpowers/specs/2026-08-14-localhost-streaming-captions-design.md) | Shipping live-captions design |
+| [`docs/superpowers/specs/2026-08-11-streaming-whisper-service-design.md`](docs/superpowers/specs/2026-08-11-streaming-whisper-service-design.md) | GPU / multi-session direction |
+| [`docs/superpowers/specs/2026-08-08-whisper-cpp-vad-migration-design.md`](docs/superpowers/specs/2026-08-08-whisper-cpp-vad-migration-design.md) | Silero VAD in the local engine |
+| [`docs/superpowers/specs/2026-08-04-multilingual-realtime-transcription-design.md`](docs/superpowers/specs/2026-08-04-multilingual-realtime-transcription-design.md) | Original product shape |
+| [`docs/superpowers/plans/`](docs/superpowers/plans/) | Implementation plans (historical) |
+| `vendor/whisper.cpp/README.md` | Upstream whisper.cpp (submodule; do not treat as this app’s docs) |
 
 ## Commands
 
-Run these from the repository root:
+From the repository root:
 
 ```bash
-npm install                                    # install all workspaces; fetch browser WASM models only
-npm run fetch-models                           # verify/fetch browser models into apps/web/public/models
-npm run dev:web                                # start the browser app
-npm run dev:transcribe                         # start the loopback transcription server
-npm run build                                  # build every workspace in dependency order
-npm test                                       # build, then test every workspace
-npm run typecheck                              # build, then typecheck every workspace
-npm run lint                                   # lint workspaces that define a lint script
-npm run test:e2e --workspace @voice/web        # Playwright browser tests
-npm run benchmark --workspace @voice/web       # synthetic UI lifecycle timing only
-npm run benchmark --workspace @voice/transcription-server
+npm install
+npm run dev:web
+npm run dev:transcribe
+npm run build
+npm test
+npm run typecheck
+npm run lint
 npm run build:native --workspace @voice/native-whisper-addon
 npm run fetch-models --workspace @voice/transcription-server -- --model small
 ```
-
-`npm run benchmark --workspace @voice/web` prints a
-`TRANSCRIPTION_LIFECYCLE_TIMING` record from injected worker events. It measures
-the UI lifecycle from Start to provisional/final rendering. It does **not** run
-audio inference and does not measure model speed, realtime factor, language
-identification, or transcription accuracy. A current example run is:
-
-```text
-TRANSCRIPTION_LIFECYCLE_TIMING {"firstProvisionalUiMs":1219,"finalUiMs":1303,"scope":"synthetic worker events; audio inference and accuracy are not measured"}
-```
-
-The transcription-server benchmark talks to an already-running live server.
-`--model` only labels the JSON. To change the model: fetch weights, set
-`VOICE_MODEL_PATH` / `VOICE_VAD_MODEL_PATH`, restart the server, then rerun
-the benchmark. Gates: `firstPartialP95Ms` ≤ 1500, `refreshP95Ms` ≤ 1000,
-`finalAfterSilenceP95Ms` ≤ 1500. If CPU `small` fails, rerun with
-`--model base` after pointing the server at `ggml-base.bin`. Do not change
-the code default.
-
-The benchmark client Origin is `VOICE_ORIGIN` (default
-`http://localhost:5173`).
-
-## Updating whisper.cpp and the WASM bridge
-
-The submodule and committed WASM output never update automatically. On a
-deliberate upstream bump:
-
-```bash
-git -C vendor/whisper.cpp fetch --tags
-git -C vendor/whisper.cpp checkout <new-tag>
-npm run build:wasm --workspace @voice/local-whisper-engine
-npm test
-git add vendor/whisper.cpp packages/local-whisper-engine/wasm
-git commit -m "chore: update whisper.cpp to <new-tag>"
-```
-
-The local rebuild command requires Emscripten 6.0.6. If it is unavailable,
-reproduce the build with the pinned container image.
-
-Bash:
-
-```bash
-docker run --rm --mount "type=bind,src=$PWD,dst=/src" -w /src \
-  emscripten/emsdk:6.0.6@sha256:be96eff5810e42c632f3f8b795388a6b596e4fb21ec28b9e1fb1bc49bb3b1eef \
-  node packages/local-whisper-engine/scripts/build-wasm.mjs
-```
-
-PowerShell:
-
-```powershell
-docker run --rm --mount "type=bind,src=$((Get-Location).Path),dst=/src" -w /src `
-  emscripten/emsdk:6.0.6@sha256:be96eff5810e42c632f3f8b795388a6b596e4fb21ec28b9e1fb1bc49bb3b1eef `
-  node packages/local-whisper-engine/scripts/build-wasm.mjs
-```
-
-Review and commit both regenerated files in
-`packages/local-whisper-engine/wasm/`. Do not rebuild them during ordinary
-install, test, or application work. Do not patch `vendor/whisper.cpp` for the
-native addon.
-
-## Known limitations
-
-- Live (this PC) uses server `small` (or operator-selected `base`/`medium`)
-  on this machine's CPU unless the addon was compiled for GPU. Offline local
-  uses quantized WASM `tiny`, which favors download size over accuracy,
-  especially for accented speech, Vietnamese, and Chinese.
-- WASM inference is CPU WebAssembly with no GPU acceleration. The runtime
-  currently invokes the bridge with one inference thread because nested
-  Chromium pthread inference stalled in real browser testing; slower devices
-  can have noticeable latency.
-- Whisper reports one language per utterance, not per word. Code-switching
-  inside one utterance is not identified precisely, and speech outside the
-  selected candidate languages is labeled `und`.
-- Silero VAD boundaries are probabilistic. Noise, overlapping speakers, short
-  pauses, and very quiet speech can merge, split, or miss utterances.
-- An uninterrupted utterance is force-split at 25 seconds to stay below
-  Whisper's 30-second encoder window.
-- Microphone capture requires browser permission, and the shipped build targets
-  current desktop Chromium rather than every browser or mobile device.
-- This app is not a safety-, medical-, legal-, or accessibility-critical
-  transcription guarantee.

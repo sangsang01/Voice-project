@@ -1,4 +1,7 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { pcmWorkletSource } from "./pcm-worklet";
 import {
   MicrophoneCaptureError,
   startMicrophoneCapture,
@@ -25,7 +28,7 @@ function createDependencies(overrides: Partial<MicrophoneDependencies> = {}) {
       getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => tracks }),
       createAudioContext: vi.fn().mockReturnValue(context),
       createWorkletNode: vi.fn().mockReturnValue(node),
-      createWorkletUrl: vi.fn().mockReturnValue("blob:pcm-worklet"),
+      createWorkletUrl: vi.fn().mockReturnValue("http://localhost:5173/pcm-worklet.js"),
       revokeWorkletUrl: vi.fn(),
       isAudioWorkletSupported: vi.fn().mockReturnValue(true),
       ...overrides,
@@ -38,6 +41,34 @@ function createDependencies(overrides: Partial<MicrophoneDependencies> = {}) {
 }
 
 describe("startMicrophoneCapture", () => {
+  it("requests a mono capture track with echo cancellation disabled", async () => {
+    const { dependencies } = createDependencies();
+
+    const capture = await startMicrophoneCapture({ onFrame: vi.fn(), dependencies });
+    await capture.stop();
+
+    expect(dependencies.getUserMedia).toHaveBeenCalledWith({
+      audio: {
+        channelCount: 1,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+      video: false,
+    });
+  });
+
+  it("does not connect the capture worklet to speakers", async () => {
+    const { dependencies, node, source, context } = createDependencies();
+    Object.assign(context, { destination: { connect: vi.fn() } });
+
+    const capture = await startMicrophoneCapture({ onFrame: vi.fn(), dependencies });
+    await capture.stop();
+
+    expect(source.connect).toHaveBeenCalledWith(node);
+    expect(node.connect).not.toHaveBeenCalled();
+  });
+
   it("constructs and resumes the context before requesting microphone permission", async () => {
     const calls: string[] = [];
     const { dependencies, context } = createDependencies({
@@ -93,6 +124,12 @@ describe("startMicrophoneCapture", () => {
       code: "UNSUPPORTED",
     });
     expect(dependencies.getUserMedia).not.toHaveBeenCalled();
+  });
+
+  it("keeps the served worklet identical to the capture source", () => {
+    const workletPath = resolve(process.cwd(), "public/pcm-worklet.js");
+    const served = readFileSync(workletPath, "utf8").replace(/\r\n/g, "\n").trim();
+    expect(served).toBe(pcmWorkletSource.replace(/\r\n/g, "\n").trim());
   });
 
   it("closes a resumed context without masking a startup failure", async () => {

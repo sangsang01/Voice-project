@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -35,6 +36,21 @@ bool AbortIfRequested(void * userData) {
   return aborting != nullptr && aborting->load(std::memory_order_acquire);
 }
 
+int AudioCtxForSamples(whisper_context * ctx, int nSamples) {
+  const int maxCtx = whisper_n_audio_ctx(ctx);
+  if (nSamples <= 0 || maxCtx <= 0) {
+    return 0;
+  }
+  // 1500 encoder frames cover 30s. Scale to the clip and pad so conv/pooling
+  // does not clip the tail. Leaving audio_ctx at 0 would encode a full 30s
+  // spectrogram on every 750ms provisional.
+  const int computed =
+      static_cast<int>(std::ceil(static_cast<double>(nSamples) * 1500.0 / (16000.0 * 30.0))) + 32;
+  // Short provisionals need enough encoder frames for conv/pooling; 32 was
+  // too small and made whisper_full fail after the first successful clip.
+  return std::max(150, std::min(maxCtx, computed));
+}
+
 void WhisperLogFilter(enum ggml_log_level level, const char * text, void * /*userData*/) {
   if (level >= GGML_LOG_LEVEL_ERROR && text != nullptr) {
     fputs(text, stderr);
@@ -57,7 +73,8 @@ class WhisperRuntimeWrap : public Napi::ObjectWrap<WhisperRuntimeWrap> {
   WhisperRuntimeWrap(const Napi::CallbackInfo & info);
   ~WhisperRuntimeWrap() override;
 
-  DecodeResult RunDecode(const std::vector<int16_t> & samples, const std::string & prompt);
+  DecodeResult RunDecode(const std::vector<int16_t> & samples, const std::string & prompt,
+                         const std::string & language);
 
  private:
   static Napi::FunctionReference constructor;
@@ -71,7 +88,7 @@ class WhisperRuntimeWrap : public Napi::ObjectWrap<WhisperRuntimeWrap> {
 
   void FreeResources();
   Napi::Value QueueDecode(const Napi::CallbackInfo & info, std::vector<int16_t> samples,
-                          std::string prompt, bool warmup);
+                          std::string prompt, std::string language, bool warmup);
 
   std::mutex decodeMutex_;
   std::mutex stateMutex_;
@@ -88,13 +105,14 @@ Napi::FunctionReference WhisperRuntimeWrap::constructor;
 class DecodeWorker : public Napi::AsyncWorker {
  public:
   DecodeWorker(Napi::Env env, Napi::Object handle, std::vector<int16_t> samples, std::string prompt,
-               bool warmup)
+               std::string language, bool warmup)
       : Napi::AsyncWorker(env),
         deferred_(Napi::Promise::Deferred::New(env)),
         handle_(Napi::Persistent(handle)),
         wrap_(WhisperRuntimeWrap::Unwrap(handle)),
         samples_(std::move(samples)),
         prompt_(std::move(prompt)),
+        language_(std::move(language)),
         warmup_(warmup) {}
 
   Napi::Promise GetPromise() { return deferred_.Promise(); }
@@ -102,7 +120,7 @@ class DecodeWorker : public Napi::AsyncWorker {
  protected:
   void Execute() override {
     try {
-      result_ = wrap_->RunDecode(samples_, prompt_);
+      result_ = wrap_->RunDecode(samples_, prompt_, language_);
     } catch (const std::exception & error) {
       SetError(error.what());
     }
@@ -131,6 +149,7 @@ class DecodeWorker : public Napi::AsyncWorker {
   WhisperRuntimeWrap * wrap_;
   std::vector<int16_t> samples_;
   std::string prompt_;
+  std::string language_;
   bool warmup_ = false;
   DecodeResult result_{};
 };
@@ -246,6 +265,11 @@ Napi::Value WhisperRuntimeWrap::PushVad(const Napi::CallbackInfo & info) {
 
   std::vector<float> probabilities;
   {
+    // whisper.cpp VAD and whisper_full share ggml CPU state. If VAD runs
+    // during decode, later whisper_full calls fail with "failed to decode"
+    // and captions stop after the first utterance. Skip ggml VAD while a
+    // decode holds decodeMutex_; samples stay in vadCarry_ until it finishes.
+    std::unique_lock<std::mutex> decodeLock(decodeMutex_, std::try_to_lock);
     std::lock_guard<std::mutex> stateLock(stateMutex_);
     if (closed_ || vctx_ == nullptr) {
       Napi::Error::New(env, "runtime is closed").ThrowAsJavaScriptException();
@@ -253,6 +277,10 @@ Napi::Value WhisperRuntimeWrap::PushVad(const Napi::CallbackInfo & info) {
     }
 
     vadCarry_.insert(vadCarry_.end(), converted.begin(), converted.end());
+    if (!decodeLock.owns_lock()) {
+      Napi::Float32Array skipped = Napi::Float32Array::New(env, 0);
+      return skipped;
+    }
     while (vadCarry_.size() >= static_cast<size_t>(kVadWindowSamples)) {
       if (!whisper_vad_detect_speech_no_reset(vctx_, vadCarry_.data(), kVadWindowSamples)) {
         vadCarry_.erase(vadCarry_.begin(), vadCarry_.begin() + kVadWindowSamples);
@@ -276,9 +304,9 @@ Napi::Value WhisperRuntimeWrap::PushVad(const Napi::CallbackInfo & info) {
 
 Napi::Value WhisperRuntimeWrap::QueueDecode(const Napi::CallbackInfo & info,
                                             std::vector<int16_t> samples, std::string prompt,
-                                            bool warmup) {
+                                            std::string language, bool warmup) {
   auto * worker = new DecodeWorker(info.Env(), info.This().As<Napi::Object>(), std::move(samples),
-                                   std::move(prompt), warmup);
+                                   std::move(prompt), std::move(language), warmup);
   Napi::Promise promise = worker->GetPromise();
   worker->Queue();
   return promise;
@@ -299,14 +327,20 @@ Napi::Value WhisperRuntimeWrap::Decode(const Napi::CallbackInfo & info) {
   if (info.Length() >= 2 && info[1].IsString()) {
     prompt = info[1].As<Napi::String>().Utf8Value();
   }
-  return QueueDecode(info, std::move(copy), std::move(prompt), false);
+  std::string language;
+  if (info.Length() >= 3 && info[2].IsString()) {
+    language = info[2].As<Napi::String>().Utf8Value();
+  }
+  return QueueDecode(info, std::move(copy), std::move(prompt), std::move(language), false);
 }
 
 Napi::Value WhisperRuntimeWrap::Warmup(const Napi::CallbackInfo & info) {
-  return QueueDecode(info, std::vector<int16_t>(WHISPER_SAMPLE_RATE, 0), std::string(), true);
+  return QueueDecode(info, std::vector<int16_t>(WHISPER_SAMPLE_RATE, 0), std::string(), std::string(),
+                     true);
 }
 
 Napi::Value WhisperRuntimeWrap::Reset(const Napi::CallbackInfo & info) {
+  abortRequested_.store(true, std::memory_order_release);
   std::lock_guard<std::mutex> stateLock(stateMutex_);
   if (!closed_ && vctx_ != nullptr) {
     whisper_vad_reset_state(vctx_);
@@ -324,7 +358,8 @@ Napi::Value WhisperRuntimeWrap::Close(const Napi::CallbackInfo & info) {
 }
 
 DecodeResult WhisperRuntimeWrap::RunDecode(const std::vector<int16_t> & samples,
-                                           const std::string & prompt) {
+                                           const std::string & prompt,
+                                           const std::string & language) {
   std::lock_guard<std::mutex> decodeLock(decodeMutex_);
   whisper_context * ctx = nullptr;
   int threads = 1;
@@ -335,6 +370,7 @@ DecodeResult WhisperRuntimeWrap::RunDecode(const std::vector<int16_t> & samples,
     }
     ctx = ctx_;
     threads = threads_;
+    abortRequested_.store(false, std::memory_order_release);
   }
 
   std::vector<float> pcm(samples.size());
@@ -344,7 +380,7 @@ DecodeResult WhisperRuntimeWrap::RunDecode(const std::vector<int16_t> & samples,
   whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
   params.n_threads = threads;
   params.translate = false;
-  params.language = nullptr;
+  params.language = language.empty() ? nullptr : language.c_str();
   params.detect_language = false;
   params.print_progress = false;
   params.print_realtime = false;
@@ -353,6 +389,7 @@ DecodeResult WhisperRuntimeWrap::RunDecode(const std::vector<int16_t> & samples,
   params.single_segment = true;
   params.no_context = true;
   params.vad = false;
+  params.audio_ctx = AudioCtxForSamples(ctx, static_cast<int>(pcm.size()));
   params.abort_callback = AbortIfRequested;
   params.abort_callback_user_data = &abortRequested_;
 

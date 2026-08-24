@@ -55,11 +55,6 @@ const CLOUD_FRAGMENT_SHADER = `
 
 export function EarthGlobe({ listening }: EarthGlobeProps) {
   const containerRef = useRef<HTMLDivElement>(null)
-  const listeningRef = useRef(listening)
-
-  useEffect(() => {
-    listeningRef.current = listening
-  }, [listening])
 
   useEffect(() => {
     const container = containerRef.current
@@ -98,7 +93,7 @@ export function EarthGlobe({ listening }: EarthGlobeProps) {
       vertexShader: EARTH_VERTEX_SHADER,
       fragmentShader: EARTH_FRAGMENT_SHADER,
     })
-    const earth = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 96), earthMaterial)
+    const earth = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 64), earthMaterial)
     const userLongitude = -new Date().getTimezoneOffset() / 4
     earth.rotation.y = ((-90 - userLongitude) * Math.PI) / 180
     scene.add(earth)
@@ -110,7 +105,7 @@ export function EarthGlobe({ listening }: EarthGlobeProps) {
       vertexShader: CLOUD_VERTEX_SHADER,
       fragmentShader: CLOUD_FRAGMENT_SHADER,
     })
-    const clouds = new THREE.Mesh(new THREE.SphereGeometry(1.012, 96, 96), cloudMaterial)
+    const clouds = new THREE.Mesh(new THREE.SphereGeometry(1.012, 64, 64), cloudMaterial)
     clouds.visible = false
     loader.load(
       TEX_CLOUDS,
@@ -157,21 +152,24 @@ export function EarthGlobe({ listening }: EarthGlobeProps) {
     resize()
 
     const yAxis = new THREE.Vector3(0, 1, 0)
-    let speed = 0
+    // ~2 minutes per revolution at any refresh rate. Listening uses the same
+    // speed as standby so Start does not snap the globe into a fast spin.
+    const RAD_PER_SEC = 0.048
+    let lastMs = performance.now()
     let raf = 0
-    const renderFrame = () => {
-      const target = listeningRef.current ? 0.02 : 0.0008
-      speed += (target - speed) * 0.04
-      earth.rotation.y += speed
-      clouds.rotation.y += speed * 1.15
+    const renderFrame = (nowMs = performance.now()) => {
+      const dt = Math.min(0.05, Math.max(0, (nowMs - lastMs) / 1000))
+      lastMs = nowMs
+      earth.rotation.y += RAD_PER_SEC * dt
+      clouds.rotation.y += RAD_PER_SEC * 1.15 * dt
       earthMaterial.uniforms.sunDir!.value.copy(sun).applyAxisAngle(yAxis, -earth.rotation.y)
       cloudMaterial.uniforms.sunDir!.value.copy(sun).applyAxisAngle(yAxis, -clouds.rotation.y)
       renderer.render(scene, camera)
     }
-    const tick = () => {
+    const tick = (nowMs: number) => {
       if (disposed) return
       raf = requestAnimationFrame(tick)
-      renderFrame()
+      renderFrame(nowMs)
     }
     requestRender = () => {
       if (!disposed) renderFrame()
@@ -193,8 +191,8 @@ export function EarthGlobe({ listening }: EarthGlobeProps) {
 
   return (
     <div
-      aria-label={listening ? 'Earth globe rotating quickly' : 'Earth globe rotating slowly'}
-      className="earth-globe"
+      aria-label={listening ? 'Earth globe listening' : 'Earth globe standby'}
+      className={listening ? 'earth-globe earth-globe--listening' : 'earth-globe'}
       ref={containerRef}
       role="img"
     />

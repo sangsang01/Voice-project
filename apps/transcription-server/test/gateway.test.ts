@@ -137,6 +137,26 @@ async function expectUpgradeRejected(port: number, protocols?: string | string[]
   expect(outcome).toBe("rejected");
 }
 
+class HungDecodeRuntime extends FakeRuntime {
+  public override open(): Promise<StreamingRuntimeSession> {
+    this.openCount += 1;
+    let speechStarted = false;
+    return Promise.resolve({
+      push(): VadUpdate {
+        if (speechStarted) return { speechStarted: false, speechEnded: false, maxDuration: false };
+        speechStarted = true;
+        return { speechStarted: true, speechEnded: false, maxDuration: false };
+      },
+      decode(): Promise<DecodeResult> {
+        return new Promise(() => undefined);
+      },
+      close(): Promise<void> {
+        return Promise.resolve();
+      },
+    });
+  }
+}
+
 class RejectingDecodeRuntime extends FakeRuntime {
   public override open(): Promise<StreamingRuntimeSession> {
     this.openCount += 1;
@@ -295,7 +315,7 @@ describe("transcription gateway", () => {
     await expect(client.closeCode).resolves.toBe(4000);
   });
 
-  it("a sequence gap produces AUDIO_GAP then close 4000", async () => {
+  it("a sequence gap warns AUDIO_GAP and keeps the session open", async () => {
     const gateway = await listen();
     const client = await startSession(gateway.port);
     client.socket.send(pcmFrame(0));
@@ -310,7 +330,11 @@ describe("transcription gateway", () => {
     expect(warning).toMatchObject({
       event: { type: "warning", code: "AUDIO_GAP" },
     });
-    await expect(client.closeCode).resolves.toBe(4000);
+    const ack = await waitFor(client, (message) => {
+      return (message as { type?: string }).type === "audio.ack" && (message as { throughSequence?: number }).throughSequence === 2;
+    });
+    expect(ack).toMatchObject({ type: "audio.ack", throughSequence: 2 });
+    expect(client.socket.readyState).toBe(WebSocket.OPEN);
   });
 
   it("rejects Origin not in allowedOrigins at upgrade", async () => {
@@ -412,7 +436,7 @@ describe("transcription gateway", () => {
     await expect(client.closeCode).resolves.toBe(4000);
   });
 
-  it("decode rejection emits a fatal event and closes the socket with 4000", async () => {
+  it("decode rejection emits a non-fatal error and keeps the session open", async () => {
     const gateway = await listen(new RejectingDecodeRuntime());
     const client = await startSession(gateway.port);
     client.socket.send(pcmFrame(0));
@@ -420,17 +444,14 @@ describe("transcription gateway", () => {
     const error = await waitFor(
       client,
       (message) => {
-        return (
-          (message as { event?: { type?: string; fatal?: boolean } }).event?.type === "error" &&
-          (message as { event?: { fatal?: boolean } }).event?.fatal === true
-        );
+        return (message as { event?: { type?: string; code?: string } }).event?.type === "error";
       },
       2500,
     );
     expect(error).toMatchObject({
-      event: { type: "error", fatal: true, code: "INTERNAL" },
+      event: { type: "error", fatal: false, code: "INTERNAL" },
     });
-    await expect(client.closeCode).resolves.toBe(4000);
+    expect(client.socket.readyState).toBe(WebSocket.OPEN);
   });
 
   it("reopens after close without reloading weights", async () => {
@@ -451,5 +472,23 @@ describe("transcription gateway", () => {
     );
     expect(runtime.openCount).toBeGreaterThan(1);
     expect(runtime.loadCount).toBe(1);
+  });
+
+  it("session.cancel still stops a session whose decode never returns", async () => {
+    const gateway = await listen(new HungDecodeRuntime());
+    const client = await startSession(gateway.port);
+    client.socket.send(pcmFrame(0));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    client.socket.send(JSON.stringify({ type: "session.stop", sessionId: request.sessionId }));
+    client.socket.send(JSON.stringify({ type: "session.cancel", sessionId: request.sessionId }));
+    await waitFor(
+      client,
+      (message) =>
+        typeof message === "object" &&
+        message !== null &&
+        (message as { type?: string }).type === "engine.event" &&
+        (message as { event?: { type?: string; state?: string } }).event?.state === "stopped",
+      2000,
+    );
   });
 });

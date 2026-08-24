@@ -388,7 +388,8 @@ describe("SessionController terminal event ownership", () => {
         return unsubscribe;
       })
       .mockImplementationOnce(() => vi.fn());
-    const microphoneFactory = vi.fn(async () => ({ stop: vi.fn(async () => undefined) }));
+    const firstMicrophoneStop = vi.fn(async () => undefined);
+    const microphoneFactory = vi.fn(async () => ({ stop: firstMicrophoneStop }));
     const controller = new SessionController({
       dispatch: vi.fn(),
       engineFactory: () => engine,
@@ -397,13 +398,17 @@ describe("SessionController terminal event ownership", () => {
 
     await controller.start(["en-US"]);
 
-    expect(microphoneFactory).not.toHaveBeenCalled();
+    // Capture now starts in parallel with model loading rather than waiting for
+    // it, so it is requested even though this session synchronously replays
+    // "stopped" from subscribe; the late-resolving capture is torn down instead.
+    expect(microphoneFactory).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(firstMicrophoneStop).toHaveBeenCalledTimes(1));
     expect(unsubscribe).toHaveBeenCalledTimes(1);
     expect(engine.session.stop).not.toHaveBeenCalled();
     expect(engine.session.cancel).not.toHaveBeenCalled();
 
     await controller.start(["en-US"]);
-    expect(microphoneFactory).toHaveBeenCalledTimes(1);
+    expect(microphoneFactory).toHaveBeenCalledTimes(2);
     await controller.dispose();
   });
 });

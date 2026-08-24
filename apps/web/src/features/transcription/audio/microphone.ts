@@ -129,7 +129,15 @@ export async function startMicrophoneCapture(
       throw new MicrophoneCaptureError("UNSUPPORTED", "AudioWorklet is not supported");
     }
 
-    stream = await dependencies.getUserMedia({ audio: { channelCount: 1 }, video: false });
+    stream = await dependencies.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+      video: false,
+    });
     workletUrl = dependencies.createWorkletUrl(pcmWorkletSource);
     await context.audioWorklet.addModule(workletUrl);
 
@@ -145,7 +153,6 @@ export async function startMicrophoneCapture(
       if (frame) options.onFrame(frame);
     };
     source.connect(workletNode);
-    if (context.destination) workletNode.connect(context.destination);
 
     abortHandler = () => {
       void stop();
@@ -206,13 +213,21 @@ function createBrowserDependencies(): MicrophoneDependencies {
       return new AudioContextConstructor();
     },
     createWorkletNode(context, name) {
-      return new AudioWorkletNode(context as AudioContext, name);
+      // Zero outputs keeps process() running without a playback path that
+      // Chromium-based security browsers (AVG) treat as echo and mute.
+      return new AudioWorkletNode(context as AudioContext, name, {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+      });
     },
-    createWorkletUrl(source) {
-      return URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    createWorkletUrl(_source) {
+      const origin = globalThis.location?.origin;
+      if (!origin) throw new MicrophoneCaptureError("UNSUPPORTED", "AudioWorklet is not supported");
+      // Same-origin file: AVG Web Shield CSP commonly blocks blob: worklets.
+      return new URL("/pcm-worklet.js", origin).href;
     },
     revokeWorkletUrl(url) {
-      URL.revokeObjectURL(url);
+      if (url.startsWith("blob:")) URL.revokeObjectURL(url);
     },
     isAudioWorkletSupported(context) {
       return Boolean(context.audioWorklet) && typeof AudioWorkletNode !== "undefined";

@@ -29,7 +29,8 @@ second terminal:
 npm run dev:web
 ```
 
-Open the Vite URL, keep **Live (this PC)** selected, and press **Start**.
+Open `http://127.0.0.1:5173` (Cursor Simple Browser, Chrome, or Edge) and
+press **Start**.
 
 Root `npm install` / `npm run fetch-models` still fetch the **browser** WASM
 `tiny` weights into `apps/web/public/models/`. Server models are a separate
@@ -41,11 +42,11 @@ fetch into `apps/transcription-server/models/`.
 | --- | --- | --- |
 | `VOICE_HOST` | `127.0.0.1` | Bind host. Non-loopback values are refused. |
 | `VOICE_PORT` | `8787` | Bind port. |
-| `VOICE_ALLOWED_ORIGINS` | `http://localhost:5173` | Comma-separated browser Origins allowed at upgrade. |
+| `VOICE_ALLOWED_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated browser Origins allowed at upgrade. |
 | `VOICE_ORIGIN` | `http://localhost:5173` | Origin the **benchmark client** sends. |
 | `VOICE_MODEL_PATH` | (required unless fake) | Multilingual Whisper weights. `.en` is rejected. |
 | `VOICE_VAD_MODEL_PATH` | (required unless fake) | Silero VAD v6.2.0 weights. |
-| `VOICE_THREADS` | `4` | Native decode threads. |
+| `VOICE_THREADS` | `8` | Native decode threads. 8 was fastest on the 16-thread reference CPU; 14 was slower. |
 | `VOICE_USE_GPU` | `0` | `0`/`1`. Use `1` only after a CUDA/Vulkan native compile. |
 | `VOICE_FAKE_RUNTIME` | unset | `1` skips the native addon (CI/demo). |
 | `VOICE_MAX_SESSIONS` | `1` | Concurrent listen sessions. |

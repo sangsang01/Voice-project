@@ -8,8 +8,10 @@ export interface SessionSchedulerOptions {
     setTimer?: typeof setTimeout;
     clearTimer?: typeof clearTimeout;
     decodeIntervalMs?: number;
+    firstDecodeDelayMs?: number;
     maxWindowMs?: number;
     overlapMs?: number;
+    stopTimeoutMs?: number;
 }
 export declare class SessionScheduler {
     private readonly request;
@@ -19,8 +21,10 @@ export declare class SessionScheduler {
     private readonly setTimer;
     private readonly clearTimer;
     private readonly decodeIntervalMs;
+    private readonly firstDecodeDelayMs;
     private readonly maxWindowMs;
     private readonly overlapMs;
+    private readonly stopTimeoutMs;
     private sequence;
     private nextOrdinal;
     private prompt;
@@ -35,6 +39,7 @@ export declare class SessionScheduler {
     private busy;
     private pump;
     private consecutiveSlowProvisionals;
+    private lastProvisional;
     constructor(options: SessionSchedulerOptions);
     start(): void;
     push(frame: PcmFrame): void;

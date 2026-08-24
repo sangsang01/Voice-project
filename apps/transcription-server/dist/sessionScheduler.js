@@ -9,8 +9,10 @@ export class SessionScheduler {
     setTimer;
     clearTimer;
     decodeIntervalMs;
+    firstDecodeDelayMs;
     maxWindowMs;
     overlapMs;
+    stopTimeoutMs;
     sequence = 0;
     nextOrdinal = 0;
     prompt = "";
@@ -25,6 +27,7 @@ export class SessionScheduler {
     busy = false;
     pump = Promise.resolve();
     consecutiveSlowProvisionals = 0;
+    lastProvisional;
     constructor(options) {
         this.request = options.request;
         this.runtime = options.runtime;
@@ -32,9 +35,11 @@ export class SessionScheduler {
         this.now = options.now ?? (() => Date.now());
         this.setTimer = options.setTimer ?? setTimeout;
         this.clearTimer = options.clearTimer ?? clearTimeout;
-        this.decodeIntervalMs = options.decodeIntervalMs ?? 750;
-        this.maxWindowMs = options.maxWindowMs ?? 8_000;
+        this.decodeIntervalMs = options.decodeIntervalMs ?? 400;
+        this.firstDecodeDelayMs = options.firstDecodeDelayMs ?? 200;
+        this.maxWindowMs = options.maxWindowMs ?? 3_000;
         this.overlapMs = options.overlapMs ?? 500;
+        this.stopTimeoutMs = options.stopTimeoutMs ?? 1_500;
     }
     start() {
         this.emitState("listening");
@@ -57,9 +62,23 @@ export class SessionScheduler {
         this.clearIntervalTimer();
         this.speaking = false;
         this.queueFrozenFinal();
-        await this.pump;
+        this.pendingProvisional = false;
+        let timeout;
+        try {
+            await Promise.race([
+                this.pump,
+                new Promise((resolve) => {
+                    timeout = this.setTimer(() => resolve(), this.stopTimeoutMs);
+                }),
+            ]);
+        }
+        finally {
+            if (timeout !== undefined)
+                this.clearTimer(timeout);
+        }
         if (this.terminal)
             return;
+        this.cancelled = true;
         this.terminal = true;
         this.emitState("stopped");
     }
@@ -69,6 +88,7 @@ export class SessionScheduler {
         this.cancelled = true;
         this.pendingFinals = [];
         this.pendingProvisional = false;
+        this.lastProvisional = undefined;
         this.live = undefined;
         this.frames = [];
         this.clearIntervalTimer();
@@ -77,6 +97,7 @@ export class SessionScheduler {
     }
     onSpeechStarted(startMs) {
         this.speaking = true;
+        console.error(`speech started ${this.request.sessionId} at ${startMs}ms`);
         this.live = {
             startMs,
             ordinal: this.nextOrdinal,
@@ -98,12 +119,23 @@ export class SessionScheduler {
             return;
         if (!this.hasUnfinalizedSpeech() || !this.live)
             return;
+        const live = this.live;
         const snapshot = this.snapshotLiveFinal();
-        this.live.finalQueued = true;
-        this.nextOrdinal = this.live.ordinal + 1;
+        live.finalQueued = true;
+        this.nextOrdinal = live.ordinal + 1;
         this.pendingProvisional = false;
-        this.pendingFinals.push(snapshot);
         this.live = undefined;
+        if (this.lastProvisional && this.lastProvisional.ordinal === live.ordinal) {
+            this.emitSegment({
+                ...this.lastProvisional,
+                revision: live.revision,
+                isFinal: true,
+            });
+            this.prompt = this.lastProvisional.text.trim();
+            this.lastProvisional = undefined;
+            return;
+        }
+        this.pendingFinals.push(snapshot);
         this.kickPump();
     }
     queueProvisional() {
@@ -128,9 +160,9 @@ export class SessionScheduler {
     ensureTimer() {
         if (this.timer !== undefined || this.terminal)
             return;
-        this.scheduleTick();
+        this.scheduleTick(this.firstDecodeDelayMs);
     }
-    scheduleTick() {
+    scheduleTick(delayMs = this.decodeIntervalMs) {
         this.timer = this.setTimer(() => {
             this.timer = undefined;
             if (this.terminal || !this.speaking || !this.live || this.live.finalQueued)
@@ -138,7 +170,7 @@ export class SessionScheduler {
             this.queueProvisional();
             if (this.speaking && !this.terminal)
                 this.scheduleTick();
-        }, this.decodeIntervalMs);
+        }, delayMs);
     }
     clearIntervalTimer() {
         if (this.timer === undefined)
@@ -155,6 +187,11 @@ export class SessionScheduler {
         this.busy = true;
         try {
             while (!this.cancelled && !this.terminal) {
+                if (this.pendingProvisional && this.speaking) {
+                    this.pendingProvisional = false;
+                    await this.runProvisional();
+                    continue;
+                }
                 const frozen = this.pendingFinals.shift();
                 if (frozen) {
                     await this.runFrozenFinal(frozen);
@@ -208,21 +245,24 @@ export class SessionScheduler {
             const result = await this.runtime.decode("provisional", audio, this.prompt);
             if (this.cancelled || this.terminal)
                 return;
-            if (!this.live || this.live.ordinal !== ordinal || this.live.finalQueued)
+            if (this.live && this.live.ordinal !== ordinal)
                 return;
+            const revision = this.live && this.live.ordinal === ordinal ? this.live.revision++ : 0;
             const elapsedMs = this.now() - startedAt;
             const audioDurationMs = (audio.length * 1000) / SAMPLE_RATE_HZ;
             this.noteProvisionalTiming(elapsedMs, audioDurationMs);
-            this.emitSegment({
+            const segment = {
                 id: `${this.request.sessionId}:${ordinal}`,
                 ordinal,
-                revision: this.live.revision++,
+                revision,
                 startMs: result.startMs,
                 endMs: result.endMs,
                 text: result.text,
-                language: { tag: "und" },
+                language: mapDetectedLanguage(result.language, result.languageProbability, this.request.candidateLanguages),
                 isFinal: false,
-            });
+            };
+            this.lastProvisional = segment;
+            this.emitSegment(segment);
         }
         catch (error) {
             this.emitDecodeError(error);
@@ -230,11 +270,11 @@ export class SessionScheduler {
     }
     emitDecodeError(error) {
         const message = error instanceof Error ? error.message : String(error);
-        const code = /timeout/i.test(message) ? "TIMEOUT" : "INTERNAL";
+        const timedOut = /timeout/i.test(message);
         this.emitEnvelope({
             type: "error",
-            code,
-            fatal: true,
+            code: timedOut ? "TIMEOUT" : "INTERNAL",
+            fatal: timedOut,
             message,
         });
     }

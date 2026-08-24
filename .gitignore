@@ -3,9 +3,12 @@ dist/
 .vite/
 *.log
 .env
-.env.local
+.env.*
 .claude/
 .worktrees/
+*.node
+.DS_Store
+Thumbs.db
 apps/web/public/models/
 apps/transcription-server/models/
 apps/transcription-server/benchmark-results/

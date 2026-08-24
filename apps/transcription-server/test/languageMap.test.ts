@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { mapDetectedLanguage } from "../src/languageMap.js";
+import { mapDetectedLanguage, pinnedWhisperLanguage, fallbackWhisperLanguages } from "../src/languageMap.js";
 
 const CANDIDATES = ["vi-VN", "en-US", "es-ES", "zh-CN"];
 
@@ -31,5 +31,30 @@ describe("mapDetectedLanguage", () => {
 
   it("honours a narrowed candidate list", () => {
     expect(mapDetectedLanguage("es", 1, ["en-US"])).toEqual({ tag: "und" });
+  });
+});
+
+describe("pinnedWhisperLanguage", () => {
+  it("pins a single candidate to a bare ISO-639-1 code", () => {
+    expect(pinnedWhisperLanguage(["en-US"])).toBe("en");
+    expect(pinnedWhisperLanguage(["vi-VN"])).toBe("vi");
+  });
+
+  it("leaves language unpinned when more than one candidate is selected", () => {
+    expect(pinnedWhisperLanguage(["en-US", "vi-VN"])).toBeUndefined();
+  });
+});
+
+describe("fallbackWhisperLanguages", () => {
+  it("returns no fallbacks when the detected language is already a candidate", () => {
+    expect(fallbackWhisperLanguages("en", ["en-US", "vi-VN"])).toEqual([]);
+  });
+
+  it("retries Vietnamese first when Chinese is detected but not selected", () => {
+    expect(fallbackWhisperLanguages("zh", ["en-US", "vi-VN"])).toEqual(["vi", "en"]);
+  });
+
+  it("does not prefer Vietnamese when Chinese is one of the candidates", () => {
+    expect(fallbackWhisperLanguages("de", ["en-US", "zh-CN"])).toEqual(["en", "zh"]);
   });
 });

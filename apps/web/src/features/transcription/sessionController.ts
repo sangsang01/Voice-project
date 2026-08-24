@@ -162,6 +162,24 @@ export class SessionController {
     let engine: TranscriptionEngine | undefined;
     let active: ActiveSession | undefined;
 
+    // Microphone capture starts immediately, in parallel with model loading,
+    // instead of waiting for it. Frames that arrive before a session exists are
+    // buffered here and flushed once it opens. Starting capture only after the
+    // model finished loading left the real audio graph's warm-up window racing
+    // against the model-loading worker's heavy WASM computation, which could
+    // leave the captured stream silent for the entire session.
+    let microphoneClaimed = false;
+    const pendingFrames: PcmFrame[] = [];
+    let deliverFrame: (frame: PcmFrame) => void = (frame) => pendingFrames.push(frame);
+    const startingMicrophone = Promise.resolve(this.microphoneFactory({
+      signal: abortController.signal,
+      onFrame: (frame) => deliverFrame(frame),
+    }));
+    // Every operation is observed through both resolve and reject handlers, per
+    // this file's established idiom, so a stale or failed capture never becomes
+    // an unhandled rejection while other work is still in flight.
+    void startingMicrophone.then(() => undefined, () => undefined);
+
     try {
       engine = cachedEngine;
       if (!engine) {
@@ -204,24 +222,17 @@ export class SessionController {
       active.unsubscribe = session.subscribe((event) => this.handleEvent(active!, event));
       if (!this.isCurrent(attempt) || this.active !== active) return attempt.sessionId;
 
-      const startingMicrophone = Promise.resolve(this.microphoneFactory({
-        signal: abortController.signal,
-        onFrame: (frame) => this.pushFrame(active!, frame),
-      }));
-      void startingMicrophone.then(
-        (capture) => {
-          if (!this.isCurrent(attempt) || this.active !== active) {
-            this.stopLateMicrophone(active!, capture);
-          }
-        },
-        () => undefined,
-      );
+      deliverFrame = (frame) => this.pushFrame(active!, frame);
+      for (const frame of pendingFrames) this.pushFrame(active, frame);
+      pendingFrames.length = 0;
+
       const microphone = await this.awaitAttempt(attempt, startingMicrophone);
       if (!this.isCurrent(attempt) || this.active !== active) {
         if (microphone) this.stopLateMicrophone(active, microphone);
         return attempt.sessionId;
       }
       active.microphone = microphone;
+      microphoneClaimed = true;
       this.finishAttempt(attempt);
       return attempt.sessionId;
     } catch (error) {
@@ -243,6 +254,22 @@ export class SessionController {
       throw failure;
     } finally {
       if (!this.isCurrent(attempt)) void this.disposePrivateEngine(attempt);
+      // A capture that resolves after every other path already returned (e.g. the
+      // engine synchronously reporting a terminated session from subscribe, before
+      // this attempt ever reached the point of adopting the microphone) would
+      // otherwise leak a live microphone stream. stopLateMicrophone is idempotent,
+      // so this never double-stops a capture already handled above.
+      if (!microphoneClaimed) {
+        const activeForCleanup = active;
+        void startingMicrophone.then(
+          (capture) => {
+            if (!capture) return;
+            if (activeForCleanup) this.stopLateMicrophone(activeForCleanup, capture);
+            else void Promise.resolve(capture.stop()).catch(() => undefined);
+          },
+          () => undefined,
+        );
+      }
     }
   }
 

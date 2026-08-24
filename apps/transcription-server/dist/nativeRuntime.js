@@ -1,4 +1,5 @@
 import { posix } from "node:path";
+import { fallbackWhisperLanguages, mapDetectedLanguage, pinnedWhisperLanguage } from "./languageMap.js";
 import { createVadGate, VAD_DEFAULTS } from "./vadGate.js";
 const DEFAULT_DECODE_TIMEOUT_MS = 30_000;
 const SILENT_VAD = { speechStarted: false, speechEnded: false, maxDuration: false };
@@ -68,13 +69,32 @@ export function createNativeStreamingRuntime(options) {
         readyPromise = undefined;
         await ready();
     }
-    async function open(_request) {
+    async function open(request) {
         await ready();
         if (activeSession)
             throw new Error("native runtime is busy");
         const gate = createVadGate();
         let windowIndex = 0;
         let reportedSpeaking = false;
+        const language = pinnedWhisperLanguage(request.candidateLanguages);
+        async function decodeOnce(audio, decodeLanguage) {
+            if (!handle)
+                throw new Error("native runtime handle is missing");
+            let timer;
+            const decodePromise = handle.decode(audio, "", decodeLanguage);
+            const timeoutPromise = new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error("TIMEOUT")), decodeTimeoutMs);
+            });
+            void decodePromise.catch(() => undefined);
+            void timeoutPromise.catch(() => undefined);
+            try {
+                return await Promise.race([decodePromise, timeoutPromise]);
+            }
+            finally {
+                if (timer !== undefined)
+                    clearTimeout(timer);
+            }
+        }
         const session = {
             push(frame) {
                 if (closed || activeSession !== session || !handle)
@@ -98,37 +118,43 @@ export function createNativeStreamingRuntime(options) {
                     if (!reportedSpeaking)
                         update.speechStarted = true;
                     reportedSpeaking = false;
-                    if (decision.reason === "silence")
+                    if (decision.reason === "silence") {
                         update.speechEnded = true;
-                    if (decision.reason === "max-duration")
+                    }
+                    if (decision.reason === "max-duration") {
                         update.maxDuration = true;
+                    }
                 }
                 return update;
             },
-            async decode(_kind, audio, prompt) {
-                if (!handle)
-                    throw new Error("native runtime handle is missing");
-                let timer;
-                const decodePromise = handle.decode(audio, prompt);
-                const timeoutPromise = new Promise((_, reject) => {
-                    timer = setTimeout(() => reject(new Error("TIMEOUT")), decodeTimeoutMs);
-                });
-                // Both legs can lose the race; attach swallows so the loser is not unhandled.
-                void decodePromise.catch(() => undefined);
-                void timeoutPromise.catch(() => undefined);
+            async decode(_kind, audio, _prompt) {
                 try {
-                    return await Promise.race([decodePromise, timeoutPromise]);
+                    let result = await decodeOnce(audio, language);
+                    if (!language) {
+                        const mapped = mapDetectedLanguage(result.language, result.languageProbability, request.candidateLanguages);
+                        if (mapped.tag === "und") {
+                            const fallback = fallbackWhisperLanguages(result.language, request.candidateLanguages)[0];
+                            if (fallback) {
+                                try {
+                                    const retried = await decodeOnce(audio, fallback);
+                                    result = { ...retried, language: fallback, languageProbability: 1 };
+                                }
+                                catch {
+                                    // Keep the auto-detect result. A forced-language retry that
+                                    // fails or hangs the native context must not drop the caption
+                                    // or pin later utterances to that language.
+                                }
+                            }
+                        }
+                    }
+                    return result;
                 }
                 catch (error) {
-                    if (error instanceof Error && /timeout/i.test(error.message)) {
-                        await recycle();
-                        throw error;
-                    }
+                    // Timeout and whisper_full failures both leave ggml state unusable.
+                    // Reload once so the next utterance can decode instead of failing
+                    // silently for the rest of the session.
+                    await recycle();
                     throw error;
-                }
-                finally {
-                    if (timer !== undefined)
-                        clearTimeout(timer);
                 }
             },
             close() {

@@ -177,7 +177,7 @@ class RemoteSession {
         this.resolveStop?.();
     }
     sendControl(type) {
-        if (this.controlSent)
+        if (this.controlSent && type !== "session.cancel")
             return;
         this.controlSent = true;
         if (this.socket.readyState !== SOCKET_OPEN)
