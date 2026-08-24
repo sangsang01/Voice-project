@@ -3,7 +3,7 @@
 ## Scope and baseline
 
 - Audited tracked content at `0d7c3b0a7f683929cd1a51e3bfb13234c79afaa1` (`codex/canonical-dev-integration`) in a clean linked worktree.
-- This is a read-only publication audit apart from adding this report. It did not change source code, ignore rules, remotes, repository visibility, or the `vendor/whisper.cpp` submodule working data.
+- This is a read-only publication audit apart from adding this report. It did not change source code, ignore rules, remotes, repository visibility, or the `vendor/whisper.cpp` submodule working data; it did not publish or push anything, and it did not delete any checkout or files.
 - The repository had 235 tracked files. All 110 commits reachable from local refs were included in the history credential-pattern scan.
 
 ## Verified status
@@ -16,6 +16,11 @@
 - **Repository configuration:** `git remote -v` produced no entries. This checkout is not configured with a GitHub destination.
 - **Legal/community files:** There is no root `LICENSE`, `NOTICE`, `CODE_OF_CONDUCT`, or `CONTRIBUTING` file. The sole tracked filename matching the legal-file inventory is a web-test fixture (`apps/web/tests/fixtures/LICENSE.md`), not repository licensing.
 - **Submodule:** `.gitmodules` pins `vendor/whisper.cpp` to `https://github.com/ggml-org/whisper.cpp` at `306c88f4d1286aec1bf96e544632897886af5501`; its working tree is uninitialized here. Its upstream license and attribution/distribution obligations must be verified at that pinned revision before release.
+
+## Blocking issues
+
+- **Technical blockers found by this audit: none.** The credential/private-key scans found no credentials, and the tracked-file inventory found no oversized model, dependency, or benchmark artifact that blocks publication.
+- **User-controlled release prerequisites:** Before presenting the repository as public/open source, select and add a root license, verify the pinned `whisper.cpp` submodule's license and attribution/distribution obligations for the intended release, and choose the GitHub destination and visibility. These are release decisions outside the scope of this audit, not defects that this audit changed.
 
 ## Issues and recommended safe cleanups
 
