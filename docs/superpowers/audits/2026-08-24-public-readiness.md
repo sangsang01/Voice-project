@@ -4,11 +4,11 @@
 
 - Audited tracked content at `0d7c3b0a7f683929cd1a51e3bfb13234c79afaa1` (`codex/canonical-dev-integration`) in a clean linked worktree.
 - This is a read-only publication audit apart from adding this report. It did not change source code, ignore rules, remotes, repository visibility, or the `vendor/whisper.cpp` submodule working data; it did not publish or push anything, and it did not delete any checkout or files.
-- The repository had 235 tracked files. All 110 commits reachable from local refs were included in the history credential-pattern scan.
+- The repository had 235 tracked files. The history credential-pattern scan used `git log --all` at audit time and covered 110 commits across local refs: the 108 commits reachable from baseline `0d7c3b0` plus two additional commits reachable only from local backup/source WIP refs. It was not a HEAD-only scan.
 
 ## Verified status
 
-- **Credentials:** No credentials were identified by the scans described below. Current tracked content and reachable Git history had zero matches for private-key headers and the selected high-confidence AWS, GitHub, Google API, Stripe, and Slack token patterns. No tracked `.env`, `.pem`, `.key`, `.p12`, or `.pfx` file was found.
+- **Credentials:** No credentials were identified by the scans described below. Baseline tracked content and the 110-commit all-local-ref history scan had zero matches for private-key headers and the selected high-confidence AWS, GitHub, Google API, Stripe, and Slack token patterns. No tracked `.env`, `.pem`, `.key`, `.p12`, or `.pfx` file was found.
 - **Size and generated-dependency inventory:** No tracked blob exceeds 5 MiB. No tracked model file, `node_modules`, or benchmark-result path was found. Model and benchmark directories are ignored.
 - **Build outputs:** 80 tracked paths are under `dist/` across `apps/transcription-server` and six packages. `.gitattributes` explicitly normalizes LF for committed `dist/` output in three packages, which is evidence that at least part of this is intentional.
 - **Documentation:** The root `README.md` is a substantive local-demo guide (setup, architecture, limitations, and commands). Its tracked text contains no image/video references, so the repository currently has no README screenshots or recorded-demo media.
@@ -61,7 +61,7 @@ All scans used Git-tracked content and did not traverse ignored `node_modules` o
 git grep -I -n -E -e '<private-key-or-token-pattern>' HEAD --
 git grep -I -n -E -e '([A-Za-z]:\\Users\\|/Users/|/home/|\\home\\)' HEAD --
 
-# Every reachable commit/ref: introductions or removals matching the same patterns
+# Original all-local-ref history scan (110 commits at audit time): introductions or removals matching the same patterns
 git log --all --format='%H' -G '<private-key-or-token-pattern>'
 
 # Inventory and repository metadata
@@ -72,7 +72,7 @@ git remote -v
 git submodule status
 ```
 
-Patterns covered private-key headers (including OpenSSH), AWS access-key prefixes, GitHub token formats, Google API-key prefixes, Stripe secret-key formats, and Slack token formats. Pattern scanning cannot prove the absence of an obfuscated or nonstandard secret; it supports the limited conclusion above that no credentials were identified in the tracked snapshot or reachable history.
+Patterns covered private-key headers (including OpenSSH), AWS access-key prefixes, GitHub token formats, Google API-key prefixes, Stripe secret-key formats, and Slack token formats. Pattern scanning cannot prove the absence of an obfuscated or nonstandard secret; it supports the limited conclusion above that no credentials were identified in the baseline tracked snapshot or the original 110-commit all-local-ref history scan.
 
 ## Publication assessment and priority
 
